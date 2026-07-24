@@ -136,3 +136,115 @@ The warning is a code quality notice about a React hooks best practice. It does 
 ### Result
 
 Application compiled and ran correctly. Warning noted for future code quality work.
+
+---
+
+## Phase 2 — Containerization Decisions
+
+## Decision 7 — Design the image requirements before writing any Dockerfile instruction
+
+### Context
+
+Phase 2B began with an existing Dockerfile in `api/`. Before analysing or modifying it, the engineering exercise was to independently identify what the image must contain — without looking at the file.
+
+### Decision
+
+Derive the complete image requirements from application knowledge before examining any Dockerfile syntax.
+
+### Reasoning
+
+Writing or reading a Dockerfile without first understanding what the image needs produces instructions that are accepted without comprehension. Identifying requirements independently — Linux OS, Node.js runtime, npm, dependency manifests, source code, startup command — creates a standard against which the actual Dockerfile can be evaluated. It transforms reading a Dockerfile from passive consumption into active engineering assessment.
+
+### Result
+
+Every instruction in the backend Dockerfile was accounted for by the pre-derived requirements. No instruction was encountered without understanding its purpose.
+
+---
+
+## Decision 8 — Separate dependency installation from source code copying
+
+### Context
+
+A Dockerfile must copy application files and install dependencies. The order of these operations determines cache behavior.
+
+### Decision
+
+Copy dependency manifests (`package.json`, `package-lock.json`) first, run `npm install`, then copy all remaining source files.
+
+### Reasoning
+
+Dependency manifests change rarely. Source files change on every development iteration. Placing dependency installation before source copy means the `npm install` layer remains cached across all source-only changes. This reduces build time from minutes to seconds for the common case of incremental source changes.
+
+### Tradeoff
+
+The Dockerfile has more instructions than a naive implementation. This is an acceptable tradeoff — the structural overhead is fixed and the performance benefit compounds across every build.
+
+### Result
+
+Incremental builds execute `npm install` only when dependency manifests change. All other builds hit the cache and proceed directly to source copy.
+
+---
+
+## Decision 9 — Use --only=production flag for npm install
+
+### Context
+
+`package.json` contains both `dependencies` (runtime) and `devDependencies` (development tools — linters, test runners, type checkers).
+
+### Decision
+
+Install only production dependencies in the image using `npm install --only=production`.
+
+### Reasoning
+
+Development tools serve no purpose in a running container. Including them increases image size and introduces packages that are not needed, not tested for production use, and represent unnecessary attack surface. The image should contain only what is required to run the application.
+
+### Result
+
+Image contains only the runtime dependency tree. Development tools are excluded.
+
+---
+
+## Decision 10 — Introduce .dockerignore before building the image
+
+### Context
+
+`COPY . .` copies the entire build context. The `api/` directory contains `node_modules/`, `.env`, `.git/`, and other files that must not be in the image.
+
+### Decision
+
+Create `.dockerignore` before executing the first build, listing all files and directories that must be excluded from the build context.
+
+### Reasoning
+
+Three distinct problems were identified that made this a requirement rather than an optimisation:
+
+1. `node_modules/` compiled for macOS would override the Linux-compiled modules installed inside the image, producing runtime failures with native modules.
+2. `.env` contains live database credentials and JWT secrets. Embedding them in an image layer makes them permanently accessible to anyone with image access.
+3. `.git/` and log files increase image size with files that have no runtime purpose.
+
+### Result
+
+Build context excludes all non-application files. Image contains only what is required. Secrets are not embedded in image layers.
+
+---
+
+## Decision 11 — Use CMD exec form rather than shell form for application startup
+
+### Context
+
+`CMD` can be written in two forms: shell form (`CMD node app.js`) or exec form (`CMD ["node", "app.js"]`).
+
+### Decision
+
+Use exec form for the application startup command.
+
+### Reasoning
+
+Shell form wraps the command in `/bin/sh -c`, making the shell process PID 1 rather than the application. The application becomes a child process of the shell. This means OS signals (SIGTERM for graceful shutdown) are sent to the shell, not the application. Graceful shutdown handling in the application is bypassed.
+
+Exec form executes the command directly as PID 1. The application receives signals correctly and the container lifecycle is tied directly to the application process.
+
+### Result
+
+`node app.js` runs as PID 1. The container stops when and only when the Node.js process exits. Signal handling works as the application expects.

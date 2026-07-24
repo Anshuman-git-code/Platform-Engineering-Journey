@@ -88,3 +88,85 @@ The existing implementation handles this correctly because it queries first, the
 Phase 0 produced no Dockerfiles, no YAML, no pipeline configuration. It produced something more valuable for this stage: a complete, accurate understanding of the application.
 
 That understanding is what makes every subsequent infrastructure decision well-informed rather than guessed.
+
+---
+
+## Phase 2 — Image Construction and Dockerfile Analysis
+
+### On Docker Layers as Immutable Filesystem Snapshots
+
+Before Phase 2, the mental model of a Docker image was vague — something between a zip file and a virtual machine. Phase 2A replaced that with a precise model: an image is a stack of immutable filesystem snapshots, where each snapshot represents the changes produced by one Dockerfile instruction.
+
+This reframing changed everything. Instructions stopped being syntax to memorise and became filesystem transformation operations to reason about. The question shifted from "what does this instruction do?" to "what filesystem state does this instruction produce, and who depends on that state?"
+
+Once layers are understood as immutable snapshots, the entire cache mechanism becomes obvious rather than magical. A cached layer is simply a stored snapshot. Docker reuses it when the input that produced it has not changed. Invalidation is not arbitrary — it follows the dependency chain of the snapshot stack.
+
+---
+
+### On Cache Invalidation — Input Changes, Not Instruction Changes
+
+The most practically significant learning in Phase 2A was understanding exactly what Docker evaluates when deciding whether to use a cached layer.
+
+The intuitive assumption — that Docker checks whether the instruction text changed — is incorrect. Docker evaluates whether the **input** to the instruction changed. For `COPY` instructions, the input is the content of the files being copied. For `RUN` instructions, the input is the filesystem state at that point, which is determined by all layers beneath it.
+
+This distinction has a direct consequence on Dockerfile structure. An instruction that depends on a frequently-changing layer will itself be invalidated frequently — regardless of whether its own instruction text or direct inputs changed. The dependency chain propagates cache invalidation downward.
+
+Understanding this made Dockerfile instruction ordering feel like dependency management rather than arbitrary convention. Stable inputs at the top. Volatile inputs at the bottom.
+
+---
+
+### On .dockerignore as a Security Boundary
+
+`.dockerignore` was initially perceived as a file that speeds up builds by excluding large directories. The investigation that preceded introducing it revealed that this framing understates its importance significantly.
+
+The most critical exclusion is `.env`. Without `.dockerignore`, every `docker build` embeds the current environment's credentials into the image layers. Image layers are permanent. Even if `.env` is deleted from the host after the build, the credentials remain embedded in the image and are accessible to anyone who can run the image. There is no way to remove a secret from a layer without rebuilding the image from scratch.
+
+This is not a performance concern. It is a security requirement. Understanding `.dockerignore` as a security boundary — not a convenience feature — changes how seriously it is treated in every future Dockerfile.
+
+---
+
+### On the Build Time / Run Time Distinction
+
+The separation between `RUN` (build time) and `CMD` (run time) initially seemed like a Docker technicality. Phase 2B analysis revealed it as a fundamental correctness boundary.
+
+Instructions that execute during the build modify the image. Instructions that execute during the run start the application. Placing an application startup command in `RUN` would execute the application during the build — waiting for requests, blocking the build process, and producing a broken image.
+
+This distinction maps directly to a broader engineering principle: building an artifact and executing an artifact are different operations with different concerns, different environments, and different failure modes. They must not be conflated.
+
+---
+
+### On `CMD` Exec Form and PID 1 Signal Handling
+
+Choosing between shell form and exec form for `CMD` initially appeared to be a syntactic preference. The consequence of the choice — which process becomes PID 1 and therefore which process receives OS signals — makes it an engineering decision with operational impact.
+
+Shell form makes the shell PID 1. The application becomes a child process. Graceful shutdown signals sent to the container reach the shell, which may or may not forward them to the application. Applications that implement graceful shutdown logic will not receive the signal. Containers may be forcibly killed after a timeout rather than shutting down cleanly.
+
+Exec form makes the application PID 1. Signals reach it directly. Graceful shutdown works as intended.
+
+This is another case where understanding the underlying mechanism — PID 1 and signal delivery, established in Phase 1 — makes a Dockerfile decision obvious rather than arbitrary.
+
+---
+
+### On Recognising the Same Pattern Across Technologies
+
+Phase 2 reinforced a pattern observed in Phase 1: engineering decisions in Docker mirror engineering decisions in other systems.
+
+Layer cache optimisation in Docker — stable inputs first, volatile inputs last — is the same principle as ordering database migrations, ordering build steps in a CI pipeline, and ordering Kubernetes resource creation. Stable dependencies before volatile ones. Things that rarely change before things that change frequently.
+
+`.dockerignore` as a security boundary mirrors `.gitignore` for keeping secrets out of version control. The mechanism differs. The principle — explicitly declare what must be excluded to prevent accidental exposure — is identical.
+
+Build time versus run time in Docker mirrors compile time versus runtime in compiled languages. Assets prepared in advance. Execution happens later. The artifact produced at build time is different from the process running at runtime.
+
+Recognising these patterns means that each new technology requires less cognitive load. The engineering principles transfer. Only the syntax is new.
+
+---
+
+## Current Progress
+
+**Phase 2A — Image Construction Concepts:** Complete.
+All foundational concepts — layers, cache, build context, build vs run time, image design — documented and understood.
+
+**Phase 2B — Backend Dockerfile Analysis:** In progress.
+All Dockerfile instructions analysed: `FROM`, `WORKDIR`, `COPY package*.json`, `RUN npm install --only=production`, `COPY . .`, `.dockerignore`, `EXPOSE`, `CMD`.
+
+Current stopping point: the engineering reasoning behind `FROM node:22-alpine` has been opened — specifically the three-component structure of the tag (`node`, `22`, `alpine`). The investigation into version selection strategy and the Alpine Linux engineering tradeoffs has been identified and scoped but not yet completed. That investigation continues in the next session.
