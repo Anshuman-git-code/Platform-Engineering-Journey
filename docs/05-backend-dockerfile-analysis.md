@@ -293,13 +293,295 @@ The array syntax (`["node", "app.js"]`) is the exec form of `CMD`. It executes t
 
 ---
 
+## Runtime vs Development Dependencies
+
+### Engineering Problem
+
+The instruction `RUN npm install --only=production` contains a flag that was examined without fully establishing the engineering reasoning behind it. The question is not what the flag does — npm's documentation covers that. The question is why a production image must contain only runtime dependencies, and what the cost of including development dependencies would be.
+
+### Investigation
+
+The `package.json` in any Node.js project contains two dependency categories:
+
+**`dependencies`** — packages required at runtime. The application cannot execute without them.
+
+| Package | Runtime Role |
+|---|---|
+| `express` | HTTP server framework — handles all incoming requests |
+| `mysql2` | Database driver — all database communication passes through it |
+| `bcryptjs` | Password hashing — used on every login and registration |
+| `jsonwebtoken` | JWT signing and verification — used on every authenticated request |
+| `cors` | Cross-origin request handling — active on every response |
+| `dotenv` | Environment variable loading — executes on server startup |
+
+**`devDependencies`** — packages required during development. They perform no function after deployment.
+
+| Package Category | Examples | Production Role |
+|---|---|---|
+| Test runners | Jest, Mocha | None — tests do not run in production |
+| Linters | ESLint | None — linting is a development activity |
+| Formatters | Prettier | None — formatting is a development activity |
+| Process managers | Nodemon | None — automatic restart on file change has no meaning in an immutable container |
+
+### Engineering Decision
+
+Install only `dependencies`. Exclude `devDependencies` from the production image.
+
+### Engineering Reasoning
+
+Including development dependencies in a production image produces measurable harm across multiple dimensions:
+
+**Image size.** Development tooling — test frameworks, their transitive dependencies, type definitions — adds significant size to the image. Every megabyte added to the image is a megabyte transmitted on every pull and every deployment. At scale, this compounds.
+
+**Attack surface.** Every package in the image is a potential vulnerability. Development packages are not maintained with the same production security standard as runtime packages. A vulnerability in a test runner or linter embedded in a production image creates risk that has no corresponding benefit — the package performs no function.
+
+**Dependency graph complexity.** Development packages introduce their own transitive dependencies. A linter may pull in dozens of packages. Each is a potential source of vulnerabilities, license issues, and dependency conflicts. Excluding development dependencies reduces the total package surface to only what the running application requires.
+
+**Build once, run many.** The production image is built once and deployed identically across environments. It should be the minimal, complete artifact required to run the application — nothing more. Development tooling is not part of that definition.
+
+### Conclusion
+
+`--only=production` is not an npm optimisation flag. It is the implementation of a production image design principle: the image contains exactly what the application requires to run, and nothing else. Every package excluded from the production image is a package that cannot be exploited, cannot be misconfigured, and does not increase the image size.
+
+---
+
+## Linux Networking Fundamentals
+
+### Engineering Problem
+
+Phase 2B documents `EXPOSE 5000` and port mapping as Docker concepts. Understanding them as Docker concepts is insufficient — it produces an engineer who knows Docker syntax but cannot reason about why networking behaves as it does when containers are involved.
+
+The deeper question: when `app.listen(5000)` executes in the Node.js API, what actually happens? Who owns the port? Who receives packets?
+
+### Investigation — The Linux Socket Lifecycle
+
+Applications do not receive network packets directly. The Linux kernel owns all networking. Applications interact with the kernel through system calls, requesting the kernel to bind to a port and deliver packets to their process. The full execution path when `app.listen(5000)` executes is:
+
+```
+app.listen(5000)          — Express API call
+        │
+        ▼
+Node.js Runtime           — translates to system call
+        │
+        ▼
+socket()                  — kernel creates a socket file descriptor
+        │
+        ▼
+bind()                    — kernel associates socket with port 5000
+        │
+        ▼
+listen()                  — kernel marks port 5000 as accepting connections
+        │
+        ▼
+Kernel Port Table         — port 5000 → Node.js process recorded
+        │
+        ▼
+accept()                  — kernel delivers incoming connections to the process
+```
+
+The application never touches a packet. It makes a sequence of system calls. The kernel performs all packet reception, protocol handling, and delivery.
+
+### The Linux Kernel Port Table
+
+The Linux kernel maintains an internal port-to-process mapping. When a process successfully calls `bind()` and `listen()`, the kernel records the association:
+
+```
+Port     Process
+─────────────────
+5000  →  node (PID 847)
+3306  →  mysqld (PID 412)
+80    →  nginx (PID 201)
+```
+
+When a packet arrives at the network interface destined for port 5000, the kernel consults this table, finds the associated process, and delivers the data through the socket. The application wakes up, reads the data, and processes it. The packet routing is entirely a kernel responsibility.
+
+### Why Two Processes Cannot Share One Port
+
+Within a single network namespace, one IP address combined with one TCP port belongs to exactly one listening process. This is enforced by the kernel at the `bind()` system call.
+
+When a second process attempts to call `bind()` on a port already registered in the kernel port table:
+
+```
+bind(5000)  →  EADDRINUSE  →  "Address already in use"
+```
+
+The kernel rejects the call. The second process cannot listen. The port is occupied.
+
+This is not a Docker limitation. It is a kernel-level constraint on socket binding. The same constraint applies on bare metal, inside virtual machines, and inside containers — within the same network namespace.
+
+### Engineering Significance
+
+Understanding the kernel as the owner of networking changes how Docker port mapping is understood. Docker does not manage ports itself. Docker configures Linux kernel features — specifically, network namespaces and iptables rules — to control which port tables are consulted for which traffic. The abstraction Docker provides sits on top of these kernel primitives.
+
+---
+
+## Network Namespaces
+
+### Engineering Problem
+
+Phase 1 established that containers run in isolated network namespaces. Phase 2B introduced port mapping as the mechanism for bridging host and container networks. Neither fully addressed the underlying question: what is a network namespace, and why does it produce the isolation properties that containers depend on?
+
+### Investigation
+
+Docker does not create another operating system. Docker does not create another kernel. Docker instructs the Linux kernel to create an additional network namespace.
+
+A network namespace is a complete, independent copy of the Linux networking stack. Each namespace contains:
+
+```
+Network Namespace
+├── localhost (127.0.0.1)
+├── Network interfaces (lo, eth0, ...)
+├── Routing table
+├── Firewall rules (iptables)
+├── IP addresses
+├── ARP table
+└── Port table (independent of all other namespaces)
+```
+
+Every component of Linux networking that normally exists once on a machine exists independently within each namespace. Two namespaces do not share any networking state. They are completely isolated networking worlds, all managed by the same kernel.
+
+When Docker creates a container, the kernel creates a new network namespace for that container. The container's processes execute within that namespace. Their socket calls — `bind()`, `listen()`, `connect()` — interact with the namespace's own port table, routing table, and interfaces. They are completely unaware of other namespaces.
+
+### Independent localhost
+
+This produces one of the most important conceptual clarifications in container networking.
+
+`localhost` does not refer to the physical machine. `localhost` refers to the loopback interface of the current network namespace.
+
+The consequence:
+
+```
+On the host machine:
+  curl localhost:5000
+  → queries host namespace port table
+  → finds Node.js if running on host
+  → no awareness of container processes
+
+Inside a container:
+  curl localhost:5000
+  → queries container namespace port table
+  → finds Node.js if running inside that container
+  → no awareness of host processes
+```
+
+The commands are syntactically identical. The namespaces they query are completely different. The results are independent.
+
+This explains a class of container networking confusion: a developer runs `curl localhost:5000` on the host machine while the API is running inside a container with no port mapping, and receives a connection refused error. The API is running and listening. The developer's curl is correct. The namespaces are simply not connected.
+
+### Independent Port Tables
+
+Each network namespace maintains its own independent port table. This is a direct consequence of the namespace isolation model.
+
+```
+Host Namespace Port Table          Container Namespace Port Table
+──────────────────────────         ──────────────────────────────
+5000  →  Host Node.js              5000  →  Container Node.js
+3306  →  Host MySQL
+```
+
+Both the host and the container can have a process listening on port 5000 simultaneously. There is no conflict. The kernel routes each request to the port table of the namespace from which the request originated.
+
+This is why multiple containers can all expose the same internal port — port 80 for three nginx containers, port 5000 for three API containers — without conflict. Each container's port 5000 entry exists in its own isolated port table. The kernel maintains them independently.
+
+### Conceptual Shift
+
+This investigation produced a fundamental shift in how Docker is understood.
+
+Before this investigation, Docker appeared to be responsible for container networking — managing ports, handling isolation, routing traffic.
+
+After this investigation, Docker is understood as software that configures existing Linux kernel features. Docker itself is the orchestration layer. The kernel provides the actual isolation primitives — namespaces, socket binding rules, routing tables. Docker's role is to invoke the kernel APIs that create and configure these structures, then manage their lifecycle.
+
+```
+docker run -p 8080:5000 api-image
+        │
+        ▼
+Docker Engine
+        │
+        ├── Creates network namespace (kernel)
+        ├── Creates container process in that namespace (kernel)
+        ├── Configures iptables forwarding rule: 8080 → container:5000 (kernel)
+        └── Manages lifecycle
+```
+
+The networking itself is entirely a kernel operation. Docker coordinates it.
+
+---
+
+## Virtual Ethernet — Introduction
+
+### Engineering Problem
+
+Network namespace isolation raises an immediate question: if a container's network is completely isolated within its own namespace, how do packets leave the container at all? Isolation that is total prevents both intrusion and communication. A container that cannot communicate is not useful.
+
+### Investigation
+
+The Linux kernel provides a networking primitive called a **virtual Ethernet pair** (veth pair). A veth pair behaves like a virtual Ethernet cable with two endpoints.
+
+```
+Host Namespace                    Container Namespace
+──────────────                    ───────────────────
+
+veth0 (host end)  ◄────────────►  eth0 (container end)
+                    virtual
+                    ethernet
+                    cable
+```
+
+The two endpoints are created together and linked. A packet written into one endpoint immediately emerges from the other. The kernel handles this transfer internally — no physical network hardware is involved.
+
+When Docker creates a container:
+- The kernel creates a veth pair
+- One endpoint remains in the host network namespace
+- The other endpoint is moved into the container's network namespace, where it appears as `eth0`
+
+From the container's perspective, `eth0` is a standard network interface. The process inside the container sends packets to `eth0` without any awareness that it is one end of a virtual cable whose other end exists in the host namespace.
+
+This mechanism is how the isolation of network namespaces is preserved while still allowing controlled packet flow between namespaces. The namespace boundaries are intact. The veth pair provides an explicit, kernel-managed channel through those boundaries.
+
+### Current Boundary
+
+This investigation establishes the veth pair as the physical connectivity mechanism between namespaces. How Docker connects multiple container namespaces to each other — and how packets are routed between them — involves the Docker bridge network. That investigation is the immediate next topic and is documented separately when completed.
+
+---
+
 ## Current Status
 
-Phase 2B analysis of the backend Dockerfile has been completed for all instructions up to and including the full structural review.
+### Completed
 
-The investigation into the specific engineering decisions behind `FROM node:22-alpine` — specifically:
-- Why Node.js version 22 was selected over other versions
-- The engineering tradeoffs of Alpine Linux versus Debian-based images (size, musl libc vs glibc, available packages)
-- Image tagging strategy and version pinning philosophy
+| Topic | Status |
+|---|---|
+| Dockerfile instruction analysis — `FROM` | Complete |
+| Dockerfile instruction analysis — `WORKDIR` | Complete |
+| Dockerfile instruction analysis — `COPY package*.json` | Complete |
+| Dockerfile instruction analysis — `RUN npm install --only=production` | Complete |
+| Dockerfile instruction analysis — `COPY . .` | Complete |
+| `.dockerignore` investigation | Complete |
+| Dockerfile instruction analysis — `EXPOSE` | Complete |
+| Dockerfile instruction analysis — `CMD` | Complete |
+| Runtime vs development dependency engineering reasoning | Complete |
+| Linux networking fundamentals — socket lifecycle | Complete |
+| Linux port table and kernel packet routing | Complete |
+| Why two processes cannot share one port | Complete |
+| Network namespaces — structure and isolation model | Complete |
+| Independent localhost per namespace | Complete |
+| Independent port tables per namespace | Complete |
+| Docker as Linux kernel configuration layer | Complete |
+| Virtual Ethernet pair — introduction | Complete |
 
-These topics are identified, scoped, and intentionally deferred to the next learning session. The current document reflects only what has been examined and concluded. No assumptions about Alpine's tradeoffs or version selection criteria are documented here — those conclusions will be added when the investigation is complete.
+### Remaining — Phase 2B Continuation
+
+| Topic | Status |
+|---|---|
+| Docker Bridge Network | Pending |
+| Packet journey: container to container | Pending |
+| Container-to-container communication model | Pending |
+| Docker Compose networking | Pending |
+| Final practical image build | Pending |
+| Image inspection | Pending |
+| Backend container execution and verification | Pending |
+| Debugging exercises | Pending |
+| Engineering retrospective | Pending |
+
+### Open Investigation
+
+The engineering decisions behind `FROM node:22-alpine` — specifically version selection strategy and the Alpine Linux engineering tradeoffs (musl libc vs glibc, image size, available system packages) — remain open. This investigation is deferred until the current networking investigation is complete.
