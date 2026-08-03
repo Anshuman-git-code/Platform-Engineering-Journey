@@ -1813,6 +1813,291 @@ Each layer has distinct failure signatures and distinct resolution paths. Miside
 
 ---
 
+## Intentional Break and Fix Exercise
+
+### Engineering Purpose
+
+This exercise replicates the debugging cycle that occurs in production environments daily: a build succeeds, a container is deployed, and the application fails at runtime. The goal is to prove experimentally that a successful build does not guarantee a runnable application, and to practice isolating the failure layer correctly.
+
+### The Introduced Defect
+
+The `CMD` instruction in the Dockerfile was modified from the correct value to a non-existent entry point:
+
+```dockerfile
+# Before — correct
+CMD ["node", "app.js"]
+
+# After — intentional defect
+CMD ["node", "server.js"]
+```
+
+No file named `server.js` exists in the project. The defect is deliberate.
+
+### Pre-Build Predictions
+
+Before executing the build, three predictions were made to verify the mental model of build-time versus runtime error separation.
+
+**Prediction 1 — Will the build succeed?**
+
+Yes. Docker does not execute `CMD` during the build. `CMD` is stored as image configuration metadata. Docker has no mechanism for verifying whether the file referenced in `CMD` exists in the image filesystem during image construction. The build will complete and the image will be tagged successfully.
+
+**Prediction 2 — Where will the failure occur?**
+
+The failure will occur at container runtime, specifically when Node.js attempts to load the entry point file. The failure sequence: Docker creates the container → ENTRYPOINT executes → Node is invoked with `server.js` → Node attempts to open `/app/server.js` → the file does not exist → Node throws MODULE_NOT_FOUND → PID 1 exits with a non-zero exit code → the container exits.
+
+**Prediction 3 — Which component will report the error?**
+
+Node.js, not Docker. Docker will execute the CMD correctly. Docker has no knowledge of what Node.js expects as an entry point. The error is an application-level failure that only Node can detect when it attempts to resolve the module path.
+
+### Build Execution
+
+```bash
+docker build -t backend:broken .
+```
+
+**Output:**
+
+```
+Sending build context to Docker daemon  5.224MB
+Step 1/7 : FROM node:22-alpine
+ ---> c610fcdfb1d5
+Step 2/7 : WORKDIR /app
+ ---> Using cache
+ ---> d90ce4a4e4e6
+Step 3/7 : COPY package*.json ./
+ ---> Using cache
+ ---> 3eecae2d38ff
+Step 4/7 : RUN npm install --only=production
+ ---> Using cache
+ ---> 22afe435dc5c
+Step 5/7 : COPY . .
+ ---> f9e913dc3cbc
+Step 6/7 : EXPOSE 5000
+ ---> Running in 9aa8a5f45c23
+ ---> 98098d74a510
+Step 7/7 : CMD ["node", "server.js"]
+ ---> Running in bd5e2df3c466
+ ---> 1cb7cf628daf
+Successfully built 1cb7cf628daf
+Successfully tagged backend:broken
+```
+
+The build succeeded. Prediction 1 confirmed.
+
+**Cache behavior during the broken build:**
+
+Steps 1 through 4 are cache hits — `FROM`, `WORKDIR`, `COPY package*.json`, and `RUN npm install` are unchanged. Step 5 (`COPY . .`) produces a new layer because the Dockerfile itself is part of the build context and was modified. Steps 6 and 7 rebuild from that point. The expensive `npm install` layer remains cached even for the broken image.
+
+### Runtime Execution
+
+```bash
+docker run --name backend-broken backend:broken
+```
+
+**Output:**
+
+```
+node:internal/modules/cjs/loader:1433
+  throw err;
+  ^
+Error: Cannot find module '/app/server.js'
+    at Function._resolveFilename (node:internal/modules/cjs/loader:1430:15)
+    ...
+    at node:internal/main/run_main_module:36:49 {
+  code: 'MODULE_NOT_FOUND',
+  requireStack: []
+}
+Node.js v22.23.2
+```
+
+**docker ps -a output (relevant entries):**
+
+```
+CONTAINER ID   IMAGE            COMMAND                  CREATED        STATUS                     PORTS                                         NAMES
+2d4815505c1f   backend:broken   "docker-entrypoint.s…"   ~1 min ago   Exited (1) ~1 min ago                                                     backend-broken
+c65dfe976438   backend:v1       "docker-entrypoint.s…"   26 min ago   Up 26 minutes              0.0.0.0:5000->5000/tcp, [::]:5000->5000/tcp   backend-test
+```
+
+### Analysis
+
+**Why the build succeeded**
+
+Docker processes `CMD ["node", "server.js"]` as a metadata operation. It stores the value in the image configuration JSON. It does not execute it. It does not check whether `server.js` exists in the image filesystem. A successful build means the image was assembled correctly — it makes no guarantee about the runtime behavior of the application inside it.
+
+**The complete failure sequence at runtime**
+
+```
+docker run backend:broken
+      │
+      ▼
+Docker creates container filesystem from image layers
+      │
+      ▼
+Docker starts PID 1: docker-entrypoint.sh (ENTRYPOINT)
+      │
+      ▼
+Entrypoint executes CMD: node server.js
+      │
+      ▼
+Node.js attempts to resolve: /app/server.js
+      │
+      ▼
+Linux stat() call: /app/server.js — ENOENT (no such file)
+      │
+      ▼
+Node throws: MODULE_NOT_FOUND
+      │
+      ▼
+Node process exits with code 1
+      │
+      ▼
+PID 1 exited — Docker records exit code 1
+      │
+      ▼
+Container status: Exited (1)
+```
+
+**Why the error is from Node, not Docker**
+
+The error message is `Cannot find module '/app/server.js'` — produced by Node's module resolution system. Docker's role ends when it starts PID 1. Everything after that is the application's responsibility. Docker behaved correctly: it created the container, started the process, and reported the exit code when the process terminated.
+
+**Exit code 1**
+
+`Exited (1)` — the exit code is the return value of the PID 1 process. Exit code 0 indicates success by convention. Any non-zero exit code indicates failure. Exit code 1 is Node's convention for a generic fatal error. In Kubernetes, a non-zero exit code triggers `CrashLoopBackOff` — the orchestrator detects the failure and restarts the container, which continues to fail, producing the loop.
+
+**Comparing container states**
+
+```
+backend-test    → Up 26 minutes     (PID 1 alive — node app.js running)
+backend-broken  → Exited (1)        (PID 1 crashed — node server.js failed)
+```
+
+The only difference between these two containers is the CMD instruction. Everything else — base image, WORKDIR, dependencies, source code, networking configuration — is identical. One CMD change cascades from image configuration → PID 1 process → container lifetime.
+
+### Engineering Lesson
+
+A successful `docker build` proves:
+- The base image was located and pulled
+- All filesystem layers were constructed correctly
+- All `COPY` operations completed
+- All `RUN` commands executed successfully
+- The image configuration was stored
+
+A successful `docker build` does not prove:
+- The application will start
+- The referenced entry point file exists
+- The application's dependencies are correctly configured
+- The application can connect to required services
+
+This is analogous to a successful compilation: the code compiled without errors, but that does not mean the program will execute correctly. Runtime failures are a separate class of problem from build failures.
+
+In production, this class of error — CrashLoopBackOff in Kubernetes — is one of the most common failure modes encountered. The debugging methodology is identical to what was practised here: inspect the container logs, identify which layer the failure belongs to, and apply the correct fix at that layer.
+
+---
+
+## Docker Storage Model — Content-Addressable Images
+
+### Engineering Problem
+
+After restoring the Dockerfile to `CMD ["node", "app.js"]` and rebuilding as `backend:v2`, the `docker images` output revealed an unexpected result:
+
+```
+IMAGE            ID             DISK USAGE   CONTENT SIZE
+backend:broken   1cb7cf628daf   257MB        63MB
+backend:v1       3f1bc0cd51ef   257MB        63MB
+backend:v2       (same ID as backend:broken)
+```
+
+`backend:broken` and `backend:v2` share the same image ID: `1cb7cf628daf`. The rebuild produced no new image.
+
+### Investigation
+
+**Why the Dockerfile was not actually restored**
+
+The build output for `backend:v2` showed:
+
+```
+Step 7/7 : CMD ["node", "server.js"]
+ ---> Using cache
+ ---> 1cb7cf628daf
+Successfully tagged backend:v2
+```
+
+The CMD was still `server.js`. The Dockerfile had not been saved before rebuilding. Docker computed the same layer hash for every instruction — including the unchanged `CMD ["node", "server.js"]` — and produced the same final image. Docker then applied the tag `backend:v2` to the existing image `1cb7cf628daf`.
+
+**Content-addressable storage**
+
+Docker identifies images by the SHA256 hash of their complete content — every layer and the configuration JSON. If the content is identical, the hash is identical. If the hash is identical, the image is identical. Docker does not create a new copy; it applies a new tag to the existing image.
+
+```
+backend:broken ──┐
+                 ├──→ sha256:1cb7cf628daf (one image, stored once)
+backend:v2     ──┘
+```
+
+This is structurally identical to Git's object model:
+
+```
+Git:                         Docker:
+Branch A ──┐                 Tag A ──┐
+           ├──→ Commit SHA           ├──→ Image SHA
+Branch B ──┘                 Tag B ──┘
+```
+
+In Git, two branch names can point to the same commit. The commit is stored once. In Docker, two tag names can point to the same image. The image is stored once.
+
+**Why this design is correct**
+
+If Docker stored a separate copy of the image for every tag applied to it, the storage cost would scale linearly with the number of tags. In a CI/CD pipeline where every build produces a new tag — `backend:main-abc1234`, `backend:main-abc1235`, `backend:latest` — and each build shares the majority of its layers with the previous build, the storage savings from content-addressable deduplication are significant.
+
+Docker applies deduplication at two levels:
+
+**Level 1 — Layer deduplication across images**
+
+Two different images that share a common layer (for example, both built `FROM node:22-alpine`) store that layer only once on disk. The layer is identified by its SHA256 hash and referenced by both image configurations.
+
+**Level 2 — Image deduplication across tags**
+
+If two tags reference identical content — as demonstrated here — they resolve to the same image SHA256. One copy is stored. Both tags are valid references to it.
+
+### Three Distinct Kinds of Docker Reuse
+
+This exercise demonstrated three forms of reuse that Docker employs:
+
+**Reuse 1 — Layer cache during build**
+
+During `docker build`, layers whose inputs have not changed are served from the local layer cache. Docker does not re-execute the instruction. This is a build-time optimisation.
+
+```
+Step 2/7 : WORKDIR /app
+ ---> Using cache
+ ---> d90ce4a4e4e6
+```
+
+**Reuse 2 — Content-addressable image identity**
+
+After the build completes, if the resulting image has identical content to an existing image, Docker assigns the new tag to the existing image SHA256. No duplicate is created. This is a storage optimisation.
+
+```
+backend:broken   1cb7cf628daf
+backend:v2       1cb7cf628daf   ← same image
+```
+
+**Reuse 3 — Layer sharing across images**
+
+Two separate images — `backend:v1` (3f1bc0cd51ef) and `backend:broken` (1cb7cf628daf) — share the same underlying layers for `FROM node:22-alpine`, `WORKDIR /app`, `COPY package*.json`, and `RUN npm install`. Those layers are stored once and referenced by both image configurations. The total storage consumed by both images is far less than 2 × 257 MB.
+
+### What docker images Disk Usage Represents
+
+```
+backend:broken   1cb7cf628daf   257MB   63MB
+backend:v1       3f1bc0cd51ef   257MB   63MB
+```
+
+The `257MB` figure represents the total uncompressed size of all layers in the image's stack, including inherited layers from `node:22-alpine`. The `63MB` figure represents the compressed content size of this image's own layers. The inherited layers are counted in the display but stored only once on disk regardless of how many images reference them.
+
+---
+
 ## Current Status
 
 ### Completed
@@ -1855,12 +2140,17 @@ Each layer has distinct failure signatures and distinct resolution paths. Miside
 | PID 1 — direct experimental verification | Complete |
 | Failure analysis — three distinct error classes | Complete |
 | Layered debugging model | Complete |
+| Intentional break and fix exercise | Complete |
+| Build-time vs runtime error distinction | Complete |
+| Exit codes and PID 1 crash lifecycle | Complete |
+| Docker storage model — content-addressable images | Complete |
+| Image tags vs image IDs | Complete |
+| Layer reuse across builds | Complete |
 
-### Remaining — Phase 2B Final
+### Remaining — Phase 2B Closure
 
 | Topic | Status |
 |---|---|
-| Intentional break and fix exercise | Pending |
 | Engineering retrospective | Pending |
 | Git commit | Pending |
 
