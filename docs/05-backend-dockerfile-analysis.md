@@ -887,6 +887,413 @@ Docker's internal DNS server, active on user-defined bridge networks, registers 
 
 ---
 
+## Build Context and the Docker Build Workflow
+
+### Engineering Problem
+
+Before executing a build, several questions require precise answers: where does Docker look for the Dockerfile, what is transmitted to Docker Engine, and what is the relationship between the project folder, the image, and the container? Imprecise answers to these questions produce incorrect mental models that surface as debugging failures in later phases.
+
+### Investigation
+
+**Where Docker locates the Dockerfile**
+
+When `docker build -t backend:v1 .` is executed, the `.` argument defines the build context — the directory whose contents are packaged and transmitted to Docker Engine before any instruction executes. Docker Engine then reads the file named `Dockerfile` from within that build context.
+
+The Dockerfile is not read by the CLI. It is read by Docker Engine after the build context is received:
+
+```
+Project Folder
+      │
+      ▼
+Docker CLI
+      │  packages build context
+      │  sends to Docker Engine
+      ▼
+Docker Engine
+      │  reads Dockerfile from build context
+      │  executes instructions sequentially
+      ▼
+Image
+```
+
+An alternative Dockerfile path can be specified explicitly:
+
+```bash
+docker build -f Dockerfile.dev .
+```
+
+This is used when multiple Dockerfiles exist in a project — for example, separate development and production build definitions.
+
+**The build context is not the Dockerfile**
+
+The build context is the complete collection of files the CLI transmits to Docker Engine before any instruction executes. In this project, the `api/` directory constitutes the build context. Everything in that directory — except files excluded by `.dockerignore` — is packaged and sent. The build output confirmed this:
+
+```
+Sending build context to Docker daemon  5.224MB
+```
+
+Docker Engine may run on a remote machine and cannot read the local filesystem directly. The CLI transmits the build context to make files available to `COPY` instructions regardless of where the engine runs.
+
+**The project lifecycle — a critical mental model**
+
+The relationship between source code, image, and container is not a linear pipeline where the project folder becomes a container. It is a branching structure:
+
+```
+Source Code
+      │
+      ▼
+docker build
+      │
+      ▼
+Docker Image
+(immutable — stored in local image store)
+      │
+      ├──────────────────────┐
+      ▼                      ▼
+docker run              docker run
+      │                      │
+      ▼                      ▼
+Container 1            Container 2
+```
+
+Modifying source code after a build has no effect on the already-built image. A new build must be executed to incorporate changes. This distinction becomes critical in Kubernetes, where deployments reference image tags — not source directories.
+
+---
+
+## First Backend Image Build
+
+### Execution
+
+```bash
+docker build -t backend:v1 .
+```
+
+### Build Output Analysis
+
+**Build context transmission**
+
+```
+Sending build context to Docker daemon  5.224MB
+```
+
+The CLI packaged the `api/` directory and transmitted it to Docker Engine before any instruction executed.
+
+**Step 1 — FROM node:22-alpine**
+
+```
+Step 1/7 : FROM node:22-alpine
+22-alpine: Pulling from library/node
+5e275a5205a0: Pulling fs layer
+2b8c8ae4a685: Pulling fs layer
+b05773cc67e1: Pulling fs layer
+...
+Status: Downloaded newer image for node:22-alpine
+---> c610fcdfb1d5
+```
+
+Docker searched the local image store — not found. Docker contacted Docker Hub, downloaded the image, and stored it locally. The image arrived as multiple filesystem layers, each prefixed with `Pulling fs layer`. The Node image is itself a layered image built by the Node maintainers on top of Alpine Linux. The hash `c610fcdfb1d5` is the starting image ID for the new build.
+
+**Step 2 — WORKDIR /app**
+
+```
+Step 2/7 : WORKDIR /app
+---> Running in 8b41dab8b346
+---> Removed intermediate container 8b41dab8b346
+---> d90ce4a4e4e6
+```
+
+`Running in 8b41dab8b346` reveals Docker's internal build mechanism. No container was explicitly started. Docker created one automatically. This occurs because an image is immutable — Docker cannot modify it directly. For every instruction that changes the filesystem, Docker:
+
+```
+Current image state
+      │
+      ▼
+Creates temporary container (writable)
+      │
+      ▼
+Executes instruction inside temporary container
+      │
+      ▼
+Captures filesystem changes as snapshot
+      │
+      ▼
+Saves snapshot as new immutable layer
+      │
+      ▼
+Deletes temporary container
+      │
+      ▼
+New image state — input for next instruction
+```
+
+The temporary container `8b41dab8b346` was created, `/app` was created inside it, the filesystem was snapshotted, and the container was deleted. Only layer `d90ce4a4e4e6` persists.
+
+**Step 3 — COPY package*.json ./**
+
+```
+Step 3/7 : COPY package*.json ./
+---> 3eecae2d38ff
+```
+
+`package.json` and `package-lock.json` were copied from the build context into `/app`. Layer `3eecae2d38ff` created. No intermediate container output is shown for `COPY` — it does not require executing a shell command.
+
+**Step 4 — RUN npm install --only=production**
+
+```
+Step 4/7 : RUN npm install --only=production
+---> Running in 5aab8133be31
+npm warn config only Use `--omit=dev` to omit dev dependencies from the install.
+added 99 packages, and audited 100 packages in 2s
+---> Removed intermediate container 5aab8133be31
+---> 22afe435dc5c
+```
+
+Temporary container `5aab8133be31`. npm executed inside it, populating `node_modules` with 99 production packages. Container deleted. Layer `22afe435dc5c` — containing the installed `node_modules` — saved at 15.3 MB. This is the most expensive layer and the primary target of the cache optimisation strategy.
+
+The npm warning `Use --omit=dev` indicates a newer npm API preference. Both `--only=production` and `--omit=dev` achieve identical results. Modern production Dockerfiles use `--omit=dev`. The functional difference is zero.
+
+**Step 5 — COPY . .**
+
+```
+Step 5/7 : COPY . .
+---> b5959015b55b
+```
+
+All remaining files from the build context — `app.js`, `controllers/`, `routes/`, `middleware/`, `models/` — copied into `/app`. Layer `b5959015b55b`: 8.11 MB. Positioned after `RUN npm install` so that source file changes invalidate only this layer and below, leaving the dependency installation layer cached.
+
+**Steps 6 and 7 — EXPOSE and CMD**
+
+```
+Step 6/7 : EXPOSE 5000
+---> Running in 5a9117b15dfe
+---> Removed intermediate container 5a9117b15dfe
+---> 259b4586262f
+
+Step 7/7 : CMD ["node","app.js"]
+---> Running in 9bd2f6ee2049
+---> Removed intermediate container 9bd2f6ee2049
+---> 3f1bc0cd51ef
+```
+
+Both produce intermediate containers. Both produce 0B layers — no filesystem changes. They update the image's configuration metadata: exposed port and default startup command.
+
+**Final output**
+
+```
+Successfully built 3f1bc0cd51ef
+Successfully tagged backend:v1
+```
+
+`3f1bc0cd51ef` is the content-addressable image identifier. `backend:v1` is the human-readable tag. Both reference the same image. The tag is a mutable pointer; the hash is the immutable identity.
+
+**Image size**
+
+```
+backend:v1   3f1bc0cd51ef   257MB   63MB
+```
+
+The final image is 257 MB. The Alpine base is ~9 MB. The Node.js runtime contributes ~156 MB. npm packages contribute 15.3 MB. Application source contributes 8.11 MB. The base image is one layer in a stack — the final image includes all layers from all ancestors.
+
+---
+
+## Immutability and the Temporary Container Build Model
+
+### Engineering Problem
+
+Understanding why Docker creates and immediately deletes a temporary container for each instruction — rather than modifying the image directly — is the single insight that explains layers, caching, and image history simultaneously.
+
+### Finding
+
+An image is immutable. Docker cannot modify an existing image. To produce a new image state, Docker must:
+
+1. Start from the current image state
+2. Create a writable container on top of it
+3. Execute one instruction inside that writable container
+4. Capture the filesystem changes as a new read-only layer
+5. Delete the writable container
+6. Use the new image state as input for the next instruction
+
+```
+Image N (read-only)
+      │
+      ▼
+Temporary container (writable layer on top of Image N)
+      │
+      ▼
+Instruction executes — filesystem changes occur in writable layer
+      │
+      ▼
+Writable layer snapshotted → new read-only layer
+      │
+      ▼
+Image N+1 = Image N + new layer
+      │
+      ▼
+Temporary container deleted
+```
+
+This model explains every observable behavior in the build output: why `Running in <hash>` appears, why `Removed intermediate container` follows immediately, why each instruction produces a distinct layer hash, and why the layer cache is possible at all.
+
+---
+
+## Layer Cache — Precise Engineering Model
+
+### Engineering Problem
+
+The layer cache was introduced conceptually in Phase 2A. After observing a real build and understanding the temporary container mechanism, the precise model can be stated.
+
+### Finding
+
+Docker does not ask whether an instruction has changed. Docker asks whether the **input** to that instruction has changed — the content of files being copied (for `COPY`) or the filesystem state at that point (for `RUN`), which is determined by all preceding layers.
+
+The rule that governs all cache behavior:
+
+> Once one layer's cache is invalidated, every subsequent layer must be rebuilt — regardless of whether those subsequent instructions changed.
+
+Each layer is built on top of the previous one. If layer N changes, layer N+1 is built on a different parent. Even if the instruction for N+1 is identical, its parent has changed, so Docker cannot guarantee the result is identical.
+
+**Applied to this Dockerfile when `controllers/user.js` changes:**
+
+```
+FROM node:22-alpine        → cache hit   (base image unchanged)
+WORKDIR /app               → cache hit   (no input change)
+COPY package*.json ./      → cache hit   (package files unchanged)
+RUN npm install            → cache hit   (input layer unchanged)
+COPY . .                   → cache MISS  (source file changed)
+EXPOSE 5000                → rebuilt     (parent layer changed)
+CMD ["node", "app.js"]     → rebuilt     (parent layer changed)
+```
+
+npm does not reinstall. The build completes in seconds. The cache optimisation from separating `COPY package*.json` from `COPY . .` is realised on every incremental source change.
+
+Each layer is a checkpoint — a saved state that can be resumed from. If a source file changes, execution resumes from the source copy layer. Everything above it is served from cache.
+
+---
+
+## Image History Analysis
+
+### Execution
+
+```bash
+docker history backend:v1
+```
+
+### Output
+
+```
+IMAGE          CREATED          CREATED BY                                      SIZE
+3f1bc0cd51ef   53 minutes ago   /bin/sh -c #(nop)  CMD ["node" "app.js"]       0B
+259b4586262f   53 minutes ago   /bin/sh -c #(nop)  EXPOSE 5000                 0B
+b5959015b55b   53 minutes ago   /bin/sh -c #(nop) COPY dir:c98251f65c862bfb6…  8.11MB
+22afe435dc5c   53 minutes ago   /bin/sh -c npm install --only=production        15.3MB
+3eecae2d38ff   53 minutes ago   /bin/sh -c #(nop) COPY multi:b5e627c4a0c9d9e…  53.2kB
+d90ce4a4e4e6   53 minutes ago   /bin/sh -c #(nop) WORKDIR /app                 8.19kB
+c610fcdfb1d5   4 days ago       CMD ["node"]                                    0B
+<missing>      4 days ago       ENTRYPOINT ["docker-entrypoint.sh"]             0B
+<missing>      4 days ago       COPY docker-entrypoint.sh /usr/local/bin/       20.5kB
+<missing>      4 days ago       RUN /bin/sh -c apk add --no-cache --virtual…   5.48MB
+<missing>      4 days ago       ENV YARN_VERSION=1.22.22                        0B
+<missing>      4 days ago       RUN /bin/sh -c addgroup -g 1000 node && …      156MB
+<missing>      4 days ago       ENV NODE_VERSION=22.23.2                        0B
+<missing>      6 weeks ago      CMD ["/bin/sh"]                                 0B
+<missing>      6 weeks ago      ADD alpine-minirootfs-3.24.1-aarch64.tar.gz…   9.31MB
+```
+
+`docker history` outputs layers newest-first. Reading bottom-to-top follows the actual build sequence.
+
+### Layer-by-Layer Analysis
+
+**Layers inherited from the Node image — not written by this project**
+
+The bottom nine layers belong to `node:22-alpine`. This project did not write them. They were inherited via `FROM node:22-alpine`.
+
+| Layer | Size | What it represents |
+|---|---|---|
+| `ADD alpine-minirootfs-3.24.1-aarch64.tar.gz` | 9.31 MB | Alpine Linux base filesystem — the foundation of the entire chain |
+| `CMD ["/bin/sh"]` | 0B | Alpine's default shell — metadata |
+| `ENV NODE_VERSION=22.23.2` | 0B | Node version recorded as image metadata |
+| `RUN addgroup -g 1000 node && ...` | 156 MB | Node.js runtime installation — the largest single layer |
+| `ENV YARN_VERSION=1.22.22` | 0B | Yarn version metadata |
+| `RUN apk add --no-cache ...` | 5.48 MB | Additional system packages via Alpine's package manager |
+| `COPY docker-entrypoint.sh ...` | 20.5 kB | Node container entrypoint script |
+| `ENTRYPOINT ["docker-entrypoint.sh"]` | 0B | Entrypoint metadata |
+| `CMD ["node"]` | 0B | Default command metadata from Node image |
+
+`FROM node:22-alpine` does not start from zero. The full ancestry is visible: Alpine Linux filesystem → Node runtime installed on Alpine → this project built on top of Node. Images inherit history. `FROM` means "continue building on top of another team's completed image."
+
+**Layers from this project's Dockerfile**
+
+| Layer | Size | Instruction |
+|---|---|---|
+| `WORKDIR /app` | 8.19 kB | `/app` directory created in image filesystem |
+| `COPY package*.json` | 53.2 kB | `package.json` and `package-lock.json` |
+| `npm install --only=production` | 15.3 MB | 99 production packages installed |
+| `COPY . .` source files | 8.11 MB | Application source code |
+| `EXPOSE 5000` | 0B | Port metadata |
+| `CMD ["node", "app.js"]` | 0B | Startup command metadata |
+
+**Why `#(nop)` appears**
+
+Instructions that do not execute arbitrary shell commands are represented internally as `#(nop)` — no operation. This designation applies to `WORKDIR`, `COPY`, `EXPOSE`, `CMD`, `ENV`, and `ENTRYPOINT`. It indicates that the instruction modified image configuration or performed a filesystem operation through Docker's internal mechanisms rather than through a shell command execution.
+
+**Why `<missing>` appears for parent layers**
+
+`<missing>` does not indicate a corrupted or absent layer. It indicates that the parent image (`node:22-alpine`) was built using BuildKit on a different machine. The individual intermediate layer image IDs are not stored locally — only the final assembled image was pulled. The layers are present and functional; their individual identifiers are simply not tracked in the local image store.
+
+**Size distribution**
+
+```
+Alpine base filesystem         9.31 MB
+Node.js runtime              156.00 MB
+Alpine packages                5.48 MB
+Node entrypoint                0.02 MB
+project node_modules          15.30 MB
+project source code            8.11 MB
+metadata layers (0B each)      0.00 MB
+──────────────────────────────────────
+Approximate total            ~194 MB
+(reported as 257 MB including filesystem overhead)
+```
+
+The Node runtime alone constitutes the majority of the final image size. This is the engineering motivation for investigating Alpine versus Debian base images — a topic identified earlier and deferred for the next session.
+
+### Filesystem Layers vs Configuration Layers — Refined Model
+
+`docker history` confirms the distinction between two categories of build output:
+
+**Filesystem layers** — produced by instructions that change the image filesystem: `FROM`, `RUN`, `COPY`, `ADD`, `WORKDIR`. These carry non-zero sizes and contain actual file content that becomes part of the container filesystem at runtime.
+
+**Configuration metadata** — produced by instructions that update the image's execution specification: `CMD`, `EXPOSE`, `ENV`, `ENTRYPOINT`, `LABEL`, `USER`. These appear in `docker history` with 0B size. They do not add filesystem content. They are stored in the image's configuration JSON alongside references to the filesystem layers.
+
+The simplified statement "every Dockerfile instruction creates a layer" is superseded by this more accurate model. `docker history` shows both categories. The 0B entries are not missing layers — they are configuration entries that carry no filesystem payload.
+
+### Image Metadata Structure
+
+A Docker image consists of two distinct components stored together:
+
+```
+Docker Image
+├── Layer Stack (filesystem)
+│   ├── Layer 0: Alpine base              9.31 MB
+│   ├── Layer 1: Node runtime           156.00 MB
+│   ├── ...
+│   ├── Layer N-2: node_modules          15.30 MB
+│   └── Layer N-1: application source    8.11 MB
+│
+└── Image Configuration (JSON)
+    ├── Cmd:          ["node", "app.js"]
+    ├── WorkingDir:   /app
+    ├── ExposedPorts: {"5000/tcp": {}}
+    ├── Env:          ["NODE_VERSION=22.23.2", ...]
+    ├── Entrypoint:   ["docker-entrypoint.sh"]
+    ├── Labels:       {...}
+    └── Architecture: arm64
+```
+
+The configuration JSON records every `CMD`, `ENV`, `EXPOSE`, `WORKDIR`, and `ENTRYPOINT` instruction as structured data. When `docker run` creates a container, it reads this configuration to determine how to start the container process. `docker inspect backend:v1` exposes this configuration in full — the next diagnostic step before container execution.
+
+---
+
 ## Current Status
 
 ### Completed
@@ -912,18 +1319,26 @@ Docker's internal DNS server, active on user-defined bridge networks, registers 
 | EXPOSE — revised understanding | Complete |
 | CMD — revised understanding and PID 1 lifecycle | Complete |
 | Networking mental model verification | Complete |
+| Build context and Docker build workflow | Complete |
+| Build lifecycle — project folder vs image vs container | Complete |
+| First backend image build — execution and output analysis | Complete |
+| Immutability and the temporary container build model | Complete |
+| Layer cache — precise engineering model | Complete |
+| Image history analysis — `docker history backend:v1` | Complete |
+| Filesystem layers vs configuration metadata — refined model | Complete |
+| Image metadata structure | Complete |
 
 ### Remaining — Phase 2B Practical
 
 | Topic | Status |
 |---|---|
-| Practical backend image build | Pending |
-| Image layer inspection | Pending |
+| Image metadata inspection — `docker inspect` | Pending |
 | Backend container execution and verification | Pending |
+| Port publishing verification | Pending |
 | Intentional failure and debugging exercise | Pending |
-| Comparison with original project Dockerfile | Pending |
 | Engineering retrospective | Pending |
+| Git commit | Pending |
 
 ### Open Investigation
 
-The engineering decisions behind `FROM node:22-alpine` — specifically version selection strategy and the Alpine Linux engineering tradeoffs (musl libc vs glibc, image size, available system packages) — remain open and will be addressed during the practical build session.
+The engineering decisions behind `FROM node:22-alpine` — specifically version selection strategy and the Alpine Linux engineering tradeoffs (musl libc vs glibc, image size, available system packages) — remain open and will be addressed during the container execution session.
