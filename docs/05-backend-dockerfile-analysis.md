@@ -540,7 +540,350 @@ This mechanism is how the isolation of network namespaces is preserved while sti
 
 ### Current Boundary
 
-This investigation establishes the veth pair as the physical connectivity mechanism between namespaces. How Docker connects multiple container namespaces to each other — and how packets are routed between them — involves the Docker bridge network. That investigation is the immediate next topic and is documented separately when completed.
+This investigation establishes the veth pair as the physical connectivity mechanism between namespaces. How Docker connects multiple container namespaces to each other — and how packets are routed between them — involves the Docker bridge network, documented in the following section.
+
+---
+
+## Docker Bridge Network
+
+### Engineering Problem
+
+Each container has a veth pair connecting its namespace to the host namespace. For a single container, this is sufficient — the host end of the veth pair can be managed directly. For multiple containers, direct veth management scales poorly. Ten containers produce ten separate veth endpoints in the host namespace, with no mechanism for the containers to communicate with each other.
+
+### Investigation — The Mesh Problem
+
+Consider the alternative: direct connections between every container that needs to communicate with every other. For five containers, that requires ten direct links. For ten containers, forty-five. For fifty, 1225. The topology becomes unmanageable.
+
+```
+Direct connection model (does not scale)
+
+Backend ──── Frontend
+   │    \   /    │
+   │     \ /     │
+   │      X      │
+   │     / \     │
+   │   /    \    │
+MySQL ──── Redis
+```
+
+Physical networks solved this problem decades ago with the Ethernet switch: one central device that every host connects to, which forwards frames to the correct destination based on MAC address.
+
+### The Docker Bridge
+
+Docker creates a virtual Ethernet switch — a bridge device — that every container's veth endpoint connects to. This bridge is visible on the host as a network interface, typically named `docker0` for the default bridge or a generated name for user-defined networks.
+
+```
+Docker Bridge (Virtual Ethernet Switch)
+          docker0 — 172.18.0.1
+               │
+    ┌──────────┼──────────┐
+    │          │          │
+  veth1      veth2      veth3
+    │          │          │
+   eth0       eth0       eth0
+    │          │          │
+ Backend    Frontend    MySQL
+172.18.0.2  172.18.0.3  172.18.0.4
+```
+
+Every container plugs into the same bridge. The bridge forwards Ethernet frames between containers exactly as a physical switch forwards frames between machines on a LAN. Containers on the same bridge network can reach each other through the bridge without any traffic leaving the host.
+
+### IP Address Allocation
+
+The bridge network operates with its own IP subnet. Docker assigns IP addresses from this subnet to each container when it starts.
+
+A typical default bridge allocation:
+
+| Host / Container | IP Address |
+|---|---|
+| Bridge (`docker0`) | 172.18.0.1 |
+| Backend container | 172.18.0.2 |
+| Frontend container | 172.18.0.3 |
+| MySQL container | 172.18.0.4 |
+
+Docker manages this allocation. The container processes are unaware of the allocation mechanism — they simply find a configured `eth0` interface when they start.
+
+### Engineering Significance
+
+The bridge network answers the scalability question raised by veth pairs. Individual veth cables provide the physical connectivity between namespaces. The bridge provides the switching fabric that connects all containers into a coherent network without requiring direct links between every pair. The two mechanisms are complementary: veth pairs are the cables, the bridge is the switch.
+
+---
+
+## Packet Journey — Browser to Application
+
+### Engineering Problem
+
+Each networking component has been examined in isolation. The engineering value of those individual investigations is realised when they are assembled into a complete, end-to-end model of how a single request travels from a browser to an application running inside a container.
+
+### Complete Request Path
+
+The scenario: a browser on the host machine requests `http://localhost:5000`. The Node.js API is running inside a container started with `docker run -p 5000:5000`.
+
+```
+Browser
+  │
+  │  GET http://localhost:5000
+  ▼
+Host TCP/IP Stack
+  │
+  │  Destination: localhost:5000
+  │  Consults host namespace port table
+  │  Port 5000 not registered to a host process
+  │  Docker port publishing rule exists: host:5000 → container:5000
+  ▼
+Docker Port Mapping (iptables rule installed by Docker Engine)
+  │
+  │  Packet redirected to bridge network
+  ▼
+Docker Bridge (docker0)
+  │
+  │  Bridge consults forwarding table
+  │  Destination IP: container 172.18.0.2
+  ▼
+veth pair
+  │
+  │  Packet transmitted through virtual cable
+  ▼
+Container eth0
+  │
+  │  Packet enters container network namespace
+  ▼
+Container Linux Kernel
+  │
+  │  Destination: port 5000
+  │  Consults container namespace port table
+  │  Port 5000 → Node.js process
+  ▼
+Node.js (PID 1)
+  │
+  ▼
+Express framework
+  │
+  ▼
+Route handler executes
+  │
+  ▼
+Response generated
+  │
+  ▼
+Reverse path: Container → veth → Bridge → Host → Browser
+```
+
+### Why Port Publishing Exists
+
+This journey makes the engineering purpose of `-p 5000:5000` unambiguous. The container's port 5000 exists in an isolated namespace. The host's port 5000 is a separate entry in the host namespace port table. Without an explicit forwarding rule, a packet arriving at the host on port 5000 finds no registered listener and is dropped.
+
+`docker run -p 5000:5000` instructs Docker Engine to install an iptables rule in the host namespace that redirects packets arriving at host port 5000 to the container's port 5000 via the bridge. The rule bridges two otherwise isolated namespaces at a specific port.
+
+Without this rule, the container is unreachable from the host regardless of what the application inside is listening on.
+
+---
+
+## Container-to-Container Communication
+
+### Engineering Problem
+
+The backend API must connect to the MySQL database. Both run as separate containers. The backend process cannot use `localhost:3306` because `localhost` inside the backend container refers to the backend container's own network namespace — MySQL is in a different namespace entirely.
+
+### Investigation — Why localhost Fails
+
+```
+Backend Container Namespace          MySQL Container Namespace
+─────────────────────────────        ──────────────────────────
+localhost → 127.0.0.1                localhost → 127.0.0.1
+Port table:                          Port table:
+  5000 → Node.js                       3306 → mysqld
+
+curl localhost:3306 from backend
+  → queries backend namespace port table
+  → port 3306 not registered
+  → connection refused
+```
+
+The commands are identical. The namespaces are different. MySQL's port 3306 is registered only in MySQL's own namespace port table. The backend's namespace has no knowledge of it.
+
+Hardcoded IP addresses would technically work — the backend could connect to `172.18.0.4:3306` — but this approach is brittle. Docker assigns IPs dynamically on each `docker compose up`. An IP assigned to MySQL in one run may be assigned to a different container in the next.
+
+### Docker DNS — Service Discovery
+
+Docker provides a built-in DNS server on user-defined bridge networks. When Docker Compose starts services, each service name is registered in Docker's internal DNS as a hostname resolving to that container's current IP address.
+
+```
+Docker DNS (internal)
+─────────────────────
+backend   →  172.18.0.2
+frontend  →  172.18.0.3
+mysql     →  172.18.0.4
+```
+
+The backend container can connect to `mysql:3306`. Docker DNS intercepts the hostname resolution, translates `mysql` to the current IP of the MySQL container, and returns it to the caller. The backend establishes a connection to the correct address without any hardcoded IP.
+
+```
+Backend: connect("mysql", 3306)
+  │
+  ▼
+Docker DNS resolver
+  │  "mysql" → 172.18.0.4
+  ▼
+TCP connection to 172.18.0.4:3306
+  │
+  ▼
+Docker Bridge forwards to MySQL container
+  │
+  ▼
+MySQL container namespace
+  │  port 3306 → mysqld
+  ▼
+MySQL accepts connection
+```
+
+This is the mechanism behind the connection string `DB_HOST=mysql` in the application's environment configuration when running under Docker Compose. The value `mysql` is not a special Docker keyword — it is the service name, which Docker DNS resolves to the correct container IP at runtime.
+
+---
+
+## Docker Compose Networking
+
+### Engineering Problem
+
+Managing bridge networks, DNS entries, IP allocation, and veth pairs manually for every multi-container application would require significant operational effort. The commands would need to be executed in the correct order, repeated on every deployment, and tracked across environments.
+
+### How Docker Compose Addresses This
+
+When `docker compose up` executes, Compose reads the service definitions and automatically provisions the complete networking infrastructure:
+
+- Creates one user-defined bridge network for the application
+- Creates veth pairs for each container
+- Connects each container to the bridge
+- Allocates IP addresses from the bridge subnet
+- Registers each service name in Docker's internal DNS
+
+All of this happens before any container starts. By the time the application containers are running, the network is fully configured and service discovery is operational.
+
+```yaml
+services:
+  backend:
+    build: ./api
+  frontend:
+    build: ./client
+  mysql:
+    image: mysql:8
+```
+
+From this definition, Compose creates:
+
+```
+bridge network: project_default
+
+DNS:
+  backend  →  assigned IP
+  frontend →  assigned IP
+  mysql    →  assigned IP
+
+backend  can reach  mysql:3306
+frontend can reach  backend:5000
+```
+
+Every service name becomes a resolvable hostname. No IP addresses are managed manually. No DNS configuration is written. The networking that required explicit kernel configuration to understand is abstracted to service names in a YAML file — but the underlying mechanism is now fully understood.
+
+---
+
+## EXPOSE — Revised Understanding
+
+### Engineering Problem
+
+`EXPOSE 5000` was introduced earlier in this document as metadata declaring the application's intended port. Having completed the networking investigation, the understanding of what `EXPOSE` does — and critically, what it does not do — can be stated precisely.
+
+### What EXPOSE Does Not Do
+
+`EXPOSE` does not call `bind()`. It does not call `listen()`. It does not install any iptables rules. It does not register any entry in the host port table. It does not make the application reachable from outside the container.
+
+The process that makes port 5000 accessible is:
+
+```
+app.listen(5000)
+  │
+  ▼
+Node.js → socket() → bind() → listen()
+  │
+  ▼
+Container namespace port table: 5000 → Node.js
+```
+
+This sequence executes entirely at runtime, driven by the application code. Docker has no involvement.
+
+### What EXPOSE Actually Does
+
+`EXPOSE` records intended port information as image metadata. It communicates to engineers reading the Dockerfile — and to orchestration tools such as Kubernetes — which port the application inside the image is expected to use.
+
+A container runs correctly without `EXPOSE` if `-p` is specified at runtime:
+
+```bash
+docker run -p 8080:5000 api-image
+```
+
+This works regardless of whether the Dockerfile contains `EXPOSE 5000`. The port forwarding rule is established by `-p`. `EXPOSE` is documentation, not configuration.
+
+---
+
+## CMD — Revised Understanding
+
+### Engineering Problem
+
+`CMD ["node", "app.js"]` was established as the runtime startup instruction. Having completed the networking and PID 1 investigation, the relationship between `CMD`, PID 1, and container lifetime can be stated completely.
+
+### Why Docker Permits Only One CMD
+
+An image represents one main process. A container's lifecycle is defined by that process. Docker monitors PID 1. When PID 1 exits, the container's job is considered complete and the container stops.
+
+```
+docker run api-image
+  │
+  ▼
+CMD executes: node app.js
+  │
+  ▼
+Node.js becomes PID 1 inside container namespace
+  │
+  ▼
+Docker Engine monitors PID 1
+  │
+  ├── PID 1 running  →  container status: running
+  └── PID 1 exits    →  container status: exited
+```
+
+This explains the behavior of every container encountered in Phase 1:
+
+- `hello-world`: PID 1 prints output and exits. Container exits immediately.
+- `nginx`: PID 1 is the nginx master process — a web server designed to run indefinitely. Container runs until explicitly stopped.
+- `node app.js`: PID 1 is the Node.js process. Container runs as long as the Express server is running. If the application crashes, PID 1 exits, the container stops, and Docker reports the exit.
+
+The exec form `CMD ["node", "app.js"]` makes `node` PID 1 directly. The shell form `CMD node app.js` would make `/bin/sh` PID 1, with `node` as a child process. Shell form breaks signal delivery — SIGTERM sent to PID 1 reaches the shell, not Node.js, and graceful shutdown handling in the application is bypassed. Exec form is the correct choice for application startup.
+
+---
+
+## Networking Mental Model — Verification Questions
+
+Before proceeding to the practical build and execution phase, the following five questions verify that the complete networking mental model is operational. Each question requires reasoning from the model, not recall of a fact.
+
+**Why is a Docker bridge needed if every container already has a veth pair?**
+
+A veth pair connects one container namespace to the host namespace. It provides connectivity between two points. For ten containers, ten veth pairs exist — but the veth pairs do not connect to each other. The bridge acts as the switching fabric that connects all container-side veth endpoints into one network. Without the bridge, containers on different veth pairs cannot communicate with each other. The bridge is the mechanism that turns isolated point-to-point cables into a shared network.
+
+**Why does localhost fail when the backend tries to connect to MySQL in another container?**
+
+`localhost` resolves to `127.0.0.1`, which is the loopback interface of the current network namespace. The backend container's loopback interface exists only within the backend namespace. MySQL is running in a separate namespace with its own loopback interface. There is no path from the backend's `127.0.0.1` to MySQL's namespace. The backend's port table has no entry for 3306. The connection is refused.
+
+**Why can the backend use `mysql:3306` instead of an IP address?**
+
+Docker's internal DNS server, active on user-defined bridge networks, registers each service name as a resolvable hostname. When the backend resolves the hostname `mysql`, Docker DNS returns the current IP address of the MySQL container on the bridge network. The backend connects to that IP. If the MySQL container is replaced and receives a new IP, DNS resolution returns the new IP automatically. No configuration change is required.
+
+**Why does `EXPOSE 5000` not make the application reachable from the browser?**
+
+`EXPOSE` is image metadata. It records which port the application intends to use. It performs no kernel operations — no `bind()`, no iptables rule, no host port registration. The application becomes reachable from the host only when a port publishing rule exists, either through `-p 5000:5000` at runtime or through a `ports` mapping in Docker Compose. That rule installs an iptables forwarding entry that redirects packets from the host port to the container port via the bridge. Without that rule, the container's namespace remains isolated from the host.
+
+**Why does the entire container stop when `node app.js` exits?**
+
+`node app.js` runs as PID 1 inside the container namespace. The Linux kernel's behavior when PID 1 exits is to send SIGTERM to all remaining processes in the namespace and tear down the process group. Docker monitors PID 1. When PID 1 exits — whether due to application crash, clean shutdown, or unhandled exception — Docker records the exit code and marks the container as exited. The container's network interfaces, filesystem, and process namespace all cease to be active. The container remains in the exited state (visible in `docker ps -a`) until explicitly removed.
 
 ---
 
@@ -550,14 +893,8 @@ This investigation establishes the veth pair as the physical connectivity mechan
 
 | Topic | Status |
 |---|---|
-| Dockerfile instruction analysis — `FROM` | Complete |
-| Dockerfile instruction analysis — `WORKDIR` | Complete |
-| Dockerfile instruction analysis — `COPY package*.json` | Complete |
-| Dockerfile instruction analysis — `RUN npm install --only=production` | Complete |
-| Dockerfile instruction analysis — `COPY . .` | Complete |
+| Dockerfile instruction analysis — all instructions | Complete |
 | `.dockerignore` investigation | Complete |
-| Dockerfile instruction analysis — `EXPOSE` | Complete |
-| Dockerfile instruction analysis — `CMD` | Complete |
 | Runtime vs development dependency engineering reasoning | Complete |
 | Linux networking fundamentals — socket lifecycle | Complete |
 | Linux port table and kernel packet routing | Complete |
@@ -566,22 +903,27 @@ This investigation establishes the veth pair as the physical connectivity mechan
 | Independent localhost per namespace | Complete |
 | Independent port tables per namespace | Complete |
 | Docker as Linux kernel configuration layer | Complete |
-| Virtual Ethernet pair — introduction | Complete |
+| Virtual Ethernet pair | Complete |
+| Docker Bridge Network | Complete |
+| Packet journey — browser to application | Complete |
+| Container-to-container communication | Complete |
+| Docker DNS and service discovery | Complete |
+| Docker Compose networking model | Complete |
+| EXPOSE — revised understanding | Complete |
+| CMD — revised understanding and PID 1 lifecycle | Complete |
+| Networking mental model verification | Complete |
 
-### Remaining — Phase 2B Continuation
+### Remaining — Phase 2B Practical
 
 | Topic | Status |
 |---|---|
-| Docker Bridge Network | Pending |
-| Packet journey: container to container | Pending |
-| Container-to-container communication model | Pending |
-| Docker Compose networking | Pending |
-| Final practical image build | Pending |
-| Image inspection | Pending |
+| Practical backend image build | Pending |
+| Image layer inspection | Pending |
 | Backend container execution and verification | Pending |
-| Debugging exercises | Pending |
+| Intentional failure and debugging exercise | Pending |
+| Comparison with original project Dockerfile | Pending |
 | Engineering retrospective | Pending |
 
 ### Open Investigation
 
-The engineering decisions behind `FROM node:22-alpine` — specifically version selection strategy and the Alpine Linux engineering tradeoffs (musl libc vs glibc, image size, available system packages) — remain open. This investigation is deferred until the current networking investigation is complete.
+The engineering decisions behind `FROM node:22-alpine` — specifically version selection strategy and the Alpine Linux engineering tradeoffs (musl libc vs glibc, image size, available system packages) — remain open and will be addressed during the practical build session.
