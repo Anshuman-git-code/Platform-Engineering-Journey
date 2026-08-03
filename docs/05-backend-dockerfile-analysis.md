@@ -1294,6 +1294,525 @@ The configuration JSON records every `CMD`, `ENV`, `EXPOSE`, `WORKDIR`, and `ENT
 
 ---
 
+## Image Metadata Inspection — docker inspect
+
+### Engineering Problem
+
+`docker history` reveals the filesystem layer stack and their sizes. It does not expose the image's execution configuration — the working directory, default command, exposed ports, environment variables, architecture, and layer content hashes. A complete understanding of what a Docker image stores requires inspecting its configuration metadata directly.
+
+### Pre-Inspection Predictions
+
+Before executing `docker inspect`, the following predictions were made about what Docker stores alongside the filesystem:
+
+| Information | Stored | Location |
+|---|---|---|
+| Default CMD | Yes | Image configuration (metadata) |
+| Working directory | Yes | Image configuration (metadata) |
+| Exposed port | Yes | Image configuration (metadata) |
+| Environment variables | Yes | Image configuration (metadata) |
+| Architecture | Yes | Image configuration (metadata) |
+| Image creation time | Yes | Image configuration (metadata) |
+| Image ID | Yes | Image configuration (metadata) |
+| Layer references | Yes | Image configuration (metadata) — RootFS |
+
+None of these are stored in the filesystem. They are stored in a separate image configuration JSON document that Docker Engine maintains alongside the layer stack.
+
+### Execution
+
+```bash
+docker inspect backend:v1
+```
+
+### Output — Key Sections
+
+```json
+{
+  "Architecture": "arm64",
+  "Os": "linux",
+  "Created": "2026-08-03T10:06:23.593764379+05:30",
+  "Id": "sha256:3f1bc0cd51ef5d6ccfb47105c02015bd8ab62e9e4f122e4b8bc2b26099bc0ff4",
+  "RepoTags": ["backend:v1"],
+  "Parent": "sha256:259b4586262f4c6f2ddcd64751004b60a11863c1c7a7a5e476ba9cefcabf59b5",
+  "Config": {
+    "Cmd": ["node", "app.js"],
+    "Entrypoint": ["docker-entrypoint.sh"],
+    "Env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "NODE_VERSION=22.23.2",
+      "YARN_VERSION=1.22.22"
+    ],
+    "ExposedPorts": {"5000/tcp": {}},
+    "WorkingDir": "/app"
+  },
+  "RootFS": {
+    "Type": "layers",
+    "Layers": [
+      "sha256:b2848c02ac6ff53d265469b5b30f649f335e546a83330cd8916d54e65e640409",
+      "sha256:d3fef5bdc333a5f541322c84298b0e6cef6957113ad169e848a42c4b779fbe2c",
+      "sha256:6382a4ffb7a1147244ea17d36036bbe78056eaeedc165f16dfce8ad3e956ce77",
+      "sha256:113c868d88add51aa5c6427b11bb578161ee73557ae501571e0ca3699d229dae",
+      "sha256:af83b96939028905d2e71e50cfafe60c67e5bec1cfc4e6708056b39de9b60c8b",
+      "sha256:ab8ebf0da4bbcffae2431a711557ce4b020eb90554c7e41e660edb30a953ab82",
+      "sha256:39c87a2566ef7d6401de123d733602a19da18fa21a01b0e4488e639e55cca809",
+      "sha256:2124971bd6bf6aa00fb53363c19d0cec7e07ce74a52e7fa1b1d6513eec345e62"
+    ]
+  },
+  "Size": 62955514
+}
+```
+
+### Analysis — Field by Field
+
+**Architecture: arm64**
+
+Docker stores the CPU architecture the image was built for. This project was built on an Apple Silicon Mac (ARM64). An image built for `arm64` cannot run on an `amd64` (Intel/AMD) server without emulation. This field is the reason multi-architecture images exist — production registries often store both `arm64` and `amd64` variants under the same tag, and Docker selects the correct one for the host architecture at pull time.
+
+**Os: linux**
+
+The container OS is Linux, regardless of the host operating system. The Mac running this build is macOS. The container runs Linux. Colima provides the Linux kernel. This field confirms what has been established across multiple investigations: Docker does not run macOS containers. Every container in this project runs on a Linux kernel provided by Colima's VM.
+
+**Config.Cmd: ["node", "app.js"]**
+
+`CMD` is stored as configuration metadata, not as an executable. At this point in the image lifecycle, no Node process exists. No port is open. No application is running. Docker is simply storing a future instruction: when a container is created from this image, execute `node app.js`. It is metadata — a sticky note attached to the image that Docker reads at container startup.
+
+**Config.Entrypoint: ["docker-entrypoint.sh"]**
+
+This was not written in this project's Dockerfile. It was inherited from `node:22-alpine`. The Node maintainers included an entrypoint script that performs initialization work before executing the CMD. The actual container startup sequence is therefore:
+
+```
+docker run backend:v1
+      │
+      ▼
+Docker starts PID 1: docker-entrypoint.sh
+      │
+      ▼
+Entrypoint script executes CMD: node app.js
+      │
+      ▼
+node process ultimately becomes PID 1
+      │
+      ▼
+Express initializes
+      │
+      ▼
+app.listen(5000) → Linux bind() → port registered
+```
+
+**Config.Env**
+
+Three environment variables are stored — none were written by this project:
+- `PATH` — standard Unix executable search path, set by Alpine
+- `NODE_VERSION=22.23.2` — set by the Node maintainers in their image
+- `YARN_VERSION=1.22.22` — set by the Node maintainers
+
+Every container created from this image will have these variables in its environment. They are inherited through the `FROM` chain and demonstrate how much configuration is inherited along with the base image's filesystem.
+
+**Config.ExposedPorts: {"5000/tcp": {}}**
+
+The `EXPOSE 5000` instruction stored as structured metadata. Docker does not open, bind, or publish this port. The field communicates the application's intended listening port to engineers and orchestration tools. It has no operational effect without a corresponding `-p` flag at runtime or a `ports` mapping in Docker Compose.
+
+**Config.WorkingDir: /app**
+
+The `/app` directory already exists in the image filesystem — it was created by the `WORKDIR` instruction during the build. This field tells Docker that when a container starts, the current working directory for all processes should be set to `/app`. The `CMD ["node", "app.js"]` therefore resolves `app.js` relative to `/app`.
+
+**Id: sha256:3f1bc0cd51ef...**
+
+The image's content-addressable identifier — a SHA256 hash of the image's complete content including all layers and configuration. `backend:v1` is a human-readable tag that points to this hash. Docker internally uses the hash as the identity. The tag is mutable — it can be moved to a different image. The hash is immutable.
+
+**Parent: sha256:259b...**
+
+The image ID of the layer immediately before the final instruction. Docker stores the parent relationship, enabling the layer chain to be traversed. This is structurally identical to Git's commit parent relationship: each commit (image layer) references its parent.
+
+**RootFS.Layers — Eight SHA256 Hashes**
+
+This is the most structurally revealing section. The image's filesystem is not stored as a single blob. It is stored as eight content-addressable layer references — each a SHA256 hash identifying one immutable filesystem snapshot.
+
+```
+Layer 1: sha256:b2848c... → Alpine base filesystem
+Layer 2: sha256:d3fef5... → Node runtime layer
+Layer 3: sha256:6382a4... → Alpine packages layer
+Layer 4: sha256:113c86... → Node entrypoint script
+Layer 5: sha256:af83b9... → WORKDIR /app
+Layer 6: sha256:ab8ebf... → COPY package*.json + npm install
+Layer 7: sha256:39c87a... → COPY . . (application source)
+Layer 8: sha256:2124971... → final metadata layer
+```
+
+The engineering connection to Git is exact: both systems use content-addressable storage where the hash identifies the exact content. An identical filesystem layer shared between two images stores only one copy on disk — Docker deduplicates by hash. This is why pulling a second Node-based image is fast when `node:22-alpine` is already present — the shared layers are already stored.
+
+**Size: 62955514 (63 MB)**
+
+The `docker inspect` size represents the actual compressed content size of this image's filesystem layers. The `docker images` display of 257 MB represents the uncompressed disk footprint of all layers including inherited ones. Both measurements are correct — they measure different things.
+
+### The Complete Image Mental Model
+
+`docker inspect` confirms the two-component structure of a Docker image:
+
+```
+Docker Image
+│
+├── Filesystem (Layer Stack)
+│   ├── sha256:b2848c...  Alpine base       9.31 MB
+│   ├── sha256:d3fef5...  Node runtime    156.00 MB
+│   ├── sha256:6382a4...  Alpine packages   5.48 MB
+│   ├── sha256:113c86...  Node entrypoint   0.02 MB
+│   ├── sha256:af83b9...  /app directory    0.01 MB
+│   ├── sha256:ab8ebf...  node_modules     15.30 MB
+│   └── sha256:39c87a...  source code       8.11 MB
+│
+└── Configuration (JSON)
+    ├── Architecture:    arm64
+    ├── Os:              linux
+    ├── Created:         2026-08-03T...
+    ├── Id:              sha256:3f1bc0...
+    ├── Cmd:             ["node", "app.js"]
+    ├── Entrypoint:      ["docker-entrypoint.sh"]
+    ├── WorkingDir:      /app
+    ├── ExposedPorts:    {5000/tcp: {}}
+    ├── Env:             [NODE_VERSION=22.23.2, ...]
+    └── RootFS.Layers:   [sha256:..., sha256:..., ...]
+```
+
+A Docker image is an immutable filesystem combined with an immutable configuration document. Together they constitute the complete specification for creating and running a container.
+
+---
+
+## Container Runtime — First Execution
+
+### Pre-Execution Predictions
+
+Before running the container, three predictions were made to verify the completeness of the mental model:
+
+**Prediction 1 — PID 1 sequence**
+The first process Docker starts is `docker-entrypoint.sh` (inherited ENTRYPOINT from `node:22-alpine`). The entrypoint script executes the CMD (`node app.js`). Node ultimately becomes PID 1. Express initialises. `app.listen(5000)` calls Linux `bind()`. Port 5000 is registered in the container namespace port table.
+
+**Prediction 2 — Browser accessibility without -p**
+`http://localhost:5000` will not be reachable. The container listens on port 5000 inside its own network namespace. The host namespace has no entry for port 5000. No forwarding rule exists. The browser will receive ERR_CONNECTION_REFUSED.
+
+**Prediction 3 — MySQL error will persist**
+The MySQL connection error will persist regardless of port publishing. The application is configured to connect to `localhost:3306` — which inside the container namespace refers to the container's own loopback interface. No MySQL process is running inside the container. The connection will be refused.
+
+### Execution Without Port Publishing
+
+```bash
+docker run --name backend-test backend:v1
+```
+
+**Observed output:**
+
+```
+🚀 Server running on http://0.0.0.0:5000
+❌ Error checking admin existence: AggregateError [ECONNREFUSED]:
+  code: 'ECONNREFUSED',
+  [errors]: [
+    Error: connect ECONNREFUSED ::1:3306
+    Error: connect ECONNREFUSED 127.0.0.1:3306
+  ]
+```
+
+**docker ps output:**
+
+```
+CONTAINER ID   IMAGE        COMMAND                  CREATED        STATUS        PORTS      NAMES
+ca055f5f1944   backend:v1   "docker-entrypoint.s…"   3 min ago   Up 3 min   5000/tcp   backend-test
+```
+
+**Browser result:** `ERR_CONNECTION_REFUSED`
+
+### Analysis of First Execution
+
+**Terminal remained occupied** — confirmed. `docker run` without `-d` attaches to the container's stdout. PID 1 (`node app.js`) is running and has not exited. The container is alive and the terminal is blocked.
+
+**Server started successfully** — `🚀 Server running on http://0.0.0.0:5000` confirms the complete startup chain executed correctly: image → container → ENTRYPOINT → node app.js → Express → `app.listen(5000)` → Linux bind(). The image is correct. The application is correct. Docker is correct.
+
+**MySQL connection refused** — `ECONNREFUSED 127.0.0.1:3306` and `ECONNREFUSED ::1:3306`. The application's database host is configured as `localhost`. Inside the container namespace, `localhost` resolves to the container's own loopback interface (`127.0.0.1` and `::1`). No MySQL process is running inside that namespace. Linux returns ECONNREFUSED. This is not a Docker failure — it is an application architecture problem. The backend is designed for multi-container deployment where MySQL runs as a separate service. It cannot find MySQL at `localhost` because MySQL is not in the same network namespace.
+
+**docker ps PORTS column: `5000/tcp`** — the container exposes port 5000 (declared via `EXPOSE`) but no host-side port is mapped. The notation `5000/tcp` without the arrow (`->`) indicates the port is declared but not published.
+
+**Browser: ERR_CONNECTION_REFUSED** — packet trace:
+
+```
+Browser: GET localhost:5000
+      │
+      ▼
+Host kernel receives packet
+      │
+      ▼
+Host namespace port table: port 5000 — no registered process
+      │
+      ▼
+No Docker forwarding rule exists (no -p was specified)
+      │
+      ▼
+Linux returns: ECONNREFUSED
+```
+
+The packet never reached Docker Engine. The container namespace was never consulted. The failure occurred entirely at the host network layer.
+
+### Three Independent States — Experimentally Verified
+
+This execution demonstrates experimentally that three states are independent:
+
+| State | Status | Evidence |
+|---|---|---|
+| Application running | ✅ | `Server running on http://0.0.0.0:5000` |
+| Container running | ✅ | `docker ps` shows Up status |
+| Browser reachable | ❌ | `ERR_CONNECTION_REFUSED` |
+
+Many engineers conflate "container running" with "application reachable." This experiment proves they are orthogonal. An application can be running correctly inside a container while being completely unreachable from the host. The missing component is the port publishing rule that bridges the two network namespaces.
+
+---
+
+## Port Publishing — Engineering Model and Verification
+
+### Engineering Problem
+
+The browser failure confirmed that container-side port listening and host-side reachability are separate concerns. Understanding exactly what `-p 5000:5000` changes — and what it does not change — is the final piece of the networking model.
+
+### What Port Publishing Does Not Do
+
+`-p 5000:5000` does not make Node listen on the host. Node is already listening on port 5000 inside the container namespace. Port publishing does not move that process, copy it, or create a second instance of it.
+
+### What Port Publishing Actually Does
+
+When `docker run -p 5000:5000` is executed, Docker Engine installs forwarding rules into the host's networking stack (via iptables on Linux). These rules intercept packets arriving at host port 5000 and redirect them into the container's network namespace via the bridge.
+
+Without port publishing:
+
+```
+Browser: localhost:5000
+      │
+      ▼
+Host kernel
+      │
+Host port table: port 5000 — no owner
+      │
+      ▼
+ECONNREFUSED — packet dropped at host
+```
+
+With port publishing:
+
+```
+Browser: localhost:5000
+      │
+      ▼
+Host kernel
+      │
+Host networking rules (installed by Docker Engine)
+      │  "port 5000 → forward to container"
+      ▼
+Docker Bridge
+      │
+      ▼
+veth pair
+      │
+      ▼
+Container eth0
+      │
+      ▼
+Container namespace port table: port 5000 → Node.js
+      │
+      ▼
+Node.js → Express → route handler
+```
+
+The host does not own port 5000 in the traditional sense. Docker has inserted a forwarding rule that intercepts traffic at host port 5000 and routes it to the container. The distinction: Docker configures the host's networking. Docker does not become the application.
+
+This is architecturally identical to an AWS Internet Gateway forwarding traffic to a private EC2 instance — the gateway does not become the EC2, it forwards to it.
+
+### Execution With Port Publishing
+
+```bash
+docker stop backend-test
+docker rm backend-test
+docker run -d --name backend-test -p 5000:5000 backend:v1
+```
+
+**docker ps output:**
+
+```
+CONTAINER ID   IMAGE        COMMAND                  CREATED        STATUS        PORTS                                         NAMES
+c65dfe976438   backend:v1   "docker-entrypoint.s…"   14 sec ago   Up 14 sec   0.0.0.0:5000->5000/tcp, [::]:5000->5000/tcp   backend-test
+```
+
+The PORTS column now shows `0.0.0.0:5000->5000/tcp` — the arrow (`->`) confirms the forwarding rule is active. `0.0.0.0` means the rule accepts connections on all host network interfaces, not just localhost. `[::]` is the IPv6 equivalent.
+
+**Browser result:** `Cannot GET /` — HTTP 404
+
+### Analysis of the 404 Response
+
+The `Cannot GET /` response is a critical diagnostic distinction from `ERR_CONNECTION_REFUSED`:
+
+| Response | Meaning | Layer of failure |
+|---|---|---|
+| `ERR_CONNECTION_REFUSED` | Packet never reached the application | Networking — no forwarding rule |
+| `Cannot GET /` with HTTP 404 | Packet reached Express; no route defined for `/` | Application — routing |
+
+The complete packet journey succeeded:
+
+```
+Browser → host port 5000 → Docker forwarding rule → bridge
+→ veth → container namespace → Node.js → Express → Router
+```
+
+Express received the request and responded with 404 because no route handler is defined for `GET /`. The API routes are defined under `/api/auth` and `/api/users`. The root path `/` has no handler — which is correct API design. The networking is working perfectly. The 404 is expected and correct application behavior.
+
+The MySQL error in the logs persists — as predicted. Port publishing fixes the host-to-container networking problem. It has no effect on the container-to-database networking problem. Those are separate architectural concerns that Docker Compose addresses by providing a shared network and DNS resolution between containers.
+
+---
+
+## Container Inspection — Internal Verification
+
+### Engineering Problem
+
+The container is running. The image metadata has been verified. The remaining question is whether the container's internal state matches everything documented in the Dockerfile and image configuration — WORKDIR, copied files, installed dependencies, environment variables, OS identity, and PID 1.
+
+### Execution
+
+```bash
+docker exec -it backend-test sh
+```
+
+Alpine Linux does not include bash by default. `sh` is the available shell.
+
+### Commands and Observations
+
+```
+/app # pwd
+/app
+```
+
+`WORKDIR /app` is confirmed. The shell opens directly in `/app`. The working directory is set correctly.
+
+```
+/app # ls
+Dockerfile         controllers        models             package-lock.json  routes
+app.js             middleware         node_modules       package.json
+```
+
+`COPY . .` is confirmed. All application files are present: source code, controllers, routes, middleware, models. `node_modules` is present — installed by `RUN npm install --only=production` during the build.
+
+```
+/app # echo $PWD
+/app
+```
+
+The `PWD` environment variable reflects the working directory — consistent with `WORKDIR /app`.
+
+```
+/app # node --version
+v22.23.2
+```
+
+`FROM node:22-alpine` is confirmed. Node.js version 22.23.2 is installed in the image and available at runtime.
+
+```
+/app # printenv | grep NODE
+NODE_VERSION=22.23.2
+```
+
+Environment variables inherited from the base image are present in the running container. `ENV` instructions in the base image propagate through `FROM` inheritance.
+
+```
+/app # cat /etc/os-release
+NAME="Alpine Linux"
+ID=alpine
+VERSION_ID=3.24.1
+PRETTY_NAME="Alpine Linux v3.24"
+HOME_URL="https://alpinelinux.org/"
+BUG_REPORT_URL="https://gitlab.alpinelinux.org/alpine/aports/-/issues"
+```
+
+The container OS is Alpine Linux 3.24.1. The host is macOS. The container is Linux. Colima provides the kernel. This is direct, in-container confirmation of the architecture described throughout Phase 1 and Phase 2.
+
+```
+/app # ps
+PID   USER     TIME  COMMAND
+    1 root      0:00 node app.js
+   19 root      0:00 sh
+   30 root      0:00 ps
+```
+
+**PID 1 is `node app.js`.** Every concept from Phase 1 about PID 1 is now confirmed by direct observation:
+
+- `node app.js` is PID 1 — the process whose lifecycle defines the container's lifetime
+- `sh` is PID 19 — the shell started by `docker exec`, a child process of PID 1's namespace
+- `ps` is PID 30 — the ps command itself
+
+When `exit` is typed, PID 19 (`sh`) terminates. The container continues running because PID 1 (`node app.js`) is still alive. If `node app.js` were killed, the container would exit — Docker monitors PID 1 and considers the container's job complete when PID 1 terminates.
+
+### Dockerfile-to-Runtime Verification Table
+
+| Dockerfile Instruction | Verification Command | Observed Result |
+|---|---|---|
+| `FROM node:22-alpine` | `cat /etc/os-release` + `node --version` | Alpine Linux 3.24.1 + Node v22.23.2 |
+| `WORKDIR /app` | `pwd` + `echo $PWD` | `/app` |
+| `COPY . .` | `ls` | All application files present |
+| `RUN npm install --only=production` | `ls node_modules` | `node_modules` populated |
+| `ENV` (inherited) | `printenv \| grep NODE` | `NODE_VERSION=22.23.2` |
+| `CMD ["node", "app.js"]` | `ps` | PID 1 is `node app.js` |
+
+Every Dockerfile instruction has been traced from source through image construction through the running container's internal state. The mental model is complete and verified.
+
+---
+
+## Failure Analysis — Three Distinct Error Classes
+
+The container execution sessions produced three distinct failure types, each at a different layer of the system. Correctly identifying which layer a failure belongs to is the primary debugging skill in containerised environments.
+
+### Class 1 — Networking Failure
+
+**Symptom:** `ERR_CONNECTION_REFUSED` in the browser
+
+**Root cause:** No port publishing rule. The host network namespace has no entry for port 5000. The packet is dropped by the host kernel before it reaches Docker.
+
+**Diagnostic indicator:** Browser receives no HTTP response at all — connection fails before a response is possible.
+
+**Resolution:** `-p 5000:5000` installs the forwarding rule.
+
+**Layer:** Host networking — Docker configuration.
+
+### Class 2 — Application Routing Failure
+
+**Symptom:** `Cannot GET /` — HTTP 404 in the browser
+
+**Root cause:** Express has no route handler for `GET /`. The API is designed with routes under `/api/auth` and `/api/users`. Requesting the root path is not a valid API endpoint.
+
+**Diagnostic indicator:** Browser receives an HTTP response (status 404). The networking layer is functioning correctly. Express processed the request.
+
+**Resolution:** Not a bug. Expected behavior for an API server. If a root route is needed, one must be defined in the Express router.
+
+**Layer:** Application — routing logic.
+
+### Class 3 — Service Dependency Failure
+
+**Symptom:** `ECONNREFUSED 127.0.0.1:3306` and `ECONNREFUSED ::1:3306` in container logs
+
+**Root cause:** The application is configured to connect to MySQL at `localhost`. Inside the container namespace, `localhost` is the container's own loopback interface. No MySQL process exists in that namespace.
+
+**Diagnostic indicator:** Error appears in application logs, not in the browser. The application started successfully but cannot complete its startup sequence (admin user check requires database).
+
+**Resolution:** Run MySQL as a separate container on the same Docker network. Configure the backend to connect to `mysql:3306` instead of `localhost:3306`. Docker DNS resolves the service name `mysql` to the MySQL container's IP. This is precisely the problem Docker Compose solves.
+
+**Layer:** Application architecture — service discovery and inter-container networking.
+
+### The Layered Debugging Model
+
+These three failures demonstrate that containerised system debugging requires reasoning through distinct layers:
+
+```
+Layer 5  Database / External Services   ECONNREFUSED :3306
+Layer 4  Application Logic              Cannot GET /  (404)
+Layer 3  Container Networking           ERR_CONNECTION_REFUSED (no -p)
+Layer 2  Container Runtime              container exited, OOM
+Layer 1  Image / Build                  missing file, wrong CMD
+```
+
+Each layer has distinct failure signatures and distinct resolution paths. Misidentifying the layer — concluding "Docker isn't working" when the actual failure is in application configuration — leads to wasted debugging effort. The correct approach is to identify the layer from the failure signature, then apply the appropriate diagnostic tool at that layer.
+
+---
+
 ## Current Status
 
 ### Completed
@@ -1327,18 +1846,24 @@ The configuration JSON records every `CMD`, `ENV`, `EXPOSE`, `WORKDIR`, and `ENT
 | Image history analysis — `docker history backend:v1` | Complete |
 | Filesystem layers vs configuration metadata — refined model | Complete |
 | Image metadata structure | Complete |
+| Image metadata inspection — `docker inspect` | Complete |
+| Container runtime — first execution without port publishing | Complete |
+| Three independent states — application, container, browser | Complete |
+| Port publishing — engineering model and verification | Complete |
+| Container internal inspection — `docker exec` | Complete |
+| Dockerfile-to-runtime verification | Complete |
+| PID 1 — direct experimental verification | Complete |
+| Failure analysis — three distinct error classes | Complete |
+| Layered debugging model | Complete |
 
-### Remaining — Phase 2B Practical
+### Remaining — Phase 2B Final
 
 | Topic | Status |
 |---|---|
-| Image metadata inspection — `docker inspect` | Pending |
-| Backend container execution and verification | Pending |
-| Port publishing verification | Pending |
-| Intentional failure and debugging exercise | Pending |
+| Intentional break and fix exercise | Pending |
 | Engineering retrospective | Pending |
 | Git commit | Pending |
 
 ### Open Investigation
 
-The engineering decisions behind `FROM node:22-alpine` — specifically version selection strategy and the Alpine Linux engineering tradeoffs (musl libc vs glibc, image size, available system packages) — remain open and will be addressed during the container execution session.
+The engineering decisions behind `FROM node:22-alpine` — specifically version selection strategy and the Alpine Linux engineering tradeoffs (musl libc vs glibc, image size, available system packages) — remain identified and will be addressed in the engineering retrospective or Phase 3.
