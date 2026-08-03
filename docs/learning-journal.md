@@ -170,3 +170,122 @@ All foundational concepts — layers, cache, build context, build vs run time, i
 All Dockerfile instructions analysed: `FROM`, `WORKDIR`, `COPY package*.json`, `RUN npm install --only=production`, `COPY . .`, `.dockerignore`, `EXPOSE`, `CMD`.
 
 Current stopping point: the engineering reasoning behind `FROM node:22-alpine` has been opened — specifically the three-component structure of the tag (`node`, `22`, `alpine`). The investigation into version selection strategy and the Alpine Linux engineering tradeoffs has been identified and scoped but not yet completed. That investigation continues in the next session.
+
+---
+
+## Phase 2B — Backend Containerization
+
+### On the Difference Between Images and Containers
+
+Before Phase 2B, the distinction between image and container felt academic. After building, running, inspecting, breaking, and fixing the backend image, it became structural.
+
+An image is a completed artifact. It is finished the moment `docker build` succeeds. Nothing about it changes after that point. A container is a live process that uses the image as its starting filesystem. The image is the recipe. The container is the meal. You can make the same meal a hundred times from the same recipe, and the recipe is unchanged by any of them.
+
+The practical consequence: when a container misbehaves, the image is usually not the problem. The problem is the runtime configuration — environment variables, port mapping, network placement, or the application's own logic. Reaching for `docker build` to fix a runtime failure is the equivalent of rewriting a recipe because the oven temperature was wrong.
+
+---
+
+### On Immutable Layers as Engineering Infrastructure
+
+The layer model initially felt like an implementation detail. Somewhere in Phase 2B it became clear it is an engineering principle.
+
+Every instruction produces a snapshot. Snapshots are immutable. Identical content produces identical hashes. Docker stores one copy and references it by many names. This is not a Docker-specific idea. It is how Git works. It is how content-delivery networks work. It is how functional programming works. Immutability plus content-addressing produces a system where sharing is free, deduplication is automatic, and correctness is guaranteed by the hash.
+
+The practical consequence: layer cache is not a performance trick. It is the natural result of building a system where every layer is identified by its content and stored exactly once. Reuse is not configured — it emerges from the design.
+
+---
+
+### On Build Time and Run Time as Separate Engineering Domains
+
+The break/fix exercise made this concrete in a way no explanation could.
+
+`CMD ["node", "server.js"]` built successfully. The image was produced. It was tagged. It passed every build-time check. Then it was run, and it failed immediately — file not found.
+
+The build phase and the runtime phase are not a pipeline. They are two independent programs with different inputs, different outputs, and different failure modes. The build phase takes source code and produces an artifact. The runtime phase takes that artifact and produces a running process. A successful artifact does not imply a successful process. A compilation succeeding does not mean the program is correct. A build succeeding does not mean the container will start.
+
+This distinction matters every time Kubernetes shows `CrashLoopBackOff`. The image built. The pod is failing. These are two different problems in two different layers.
+
+---
+
+### On Linux Namespaces as the Real Foundation
+
+The most significant conceptual shift in Phase 2B was understanding that Docker does not own networking. Linux does.
+
+Docker's port publishing installs iptables rules. Docker's network isolation creates network namespaces. Docker's container isolation creates process namespaces. Docker's filesystem layering uses overlay filesystems. Every one of these is a Linux kernel primitive. Docker is the orchestration layer that calls the kernel APIs that create and configure these structures, then manages their lifecycle.
+
+This means that understanding a Docker networking problem requires understanding the Linux networking model: port tables, namespace isolation, the loopback interface being namespace-scoped, and iptables as the forwarding mechanism. The Docker abstraction is thin. When the abstraction leaks — as it does during debugging — the Linux model is directly visible.
+
+---
+
+### On localhost Not Meaning the Physical Machine
+
+This took time to fully internalise.
+
+`localhost` is not the machine. It is the loopback interface of the current network namespace. Every network namespace has its own loopback interface. A container's `localhost` and the host's `localhost` are completely separate interfaces, registered in completely separate port tables.
+
+`curl localhost:5000` from the host and `curl localhost:5000` from inside a container are syntactically identical commands that query completely different port tables and may produce completely different results.
+
+The consequence is immediate and practical: `DB_HOST=localhost` in a container's environment means "look for the database in this container's own namespace." If the database is in a different container, `localhost` will never find it. The correct value is the database service's name — resolved by Docker DNS to the container's IP on the shared network.
+
+---
+
+### On Docker Bridge and veth as Physical Infrastructure
+
+Network namespaces explain isolation. They do not explain connectivity.
+
+The veth pair is what makes isolated namespaces useful: one end in the host namespace, one end moved into the container namespace as `eth0`. A packet entering one end emerges from the other. The bridge aggregates all container-side veth endpoints into a single virtual switch, allowing containers to communicate without requiring direct connections between every pair.
+
+What changed after understanding this: port publishing stopped being a Docker configuration option and became a physical infrastructure question. Without the iptables forwarding rule, there is no connection between the host's port table and the container's network namespace. The packet arrives at the host, finds nothing listening at that port, and is dropped. The container may be running perfectly. The connection simply does not exist. `-p` creates the rule. The infrastructure then exists. That is all that changes.
+
+---
+
+### On EXPOSE Being Documentation
+
+`EXPOSE 5000` produces a 0B layer in `docker history`. It calls no kernel function. It opens no port. It creates no forwarding rule.
+
+After running a container without port publishing and observing `ERR_CONNECTION_REFUSED`, and then running it with `-p 5000:5000` and observing a successful response, the role of `EXPOSE` became clear by its absence from that story. `EXPOSE` was present in the image the entire time. Its presence or absence changed nothing about reachability.
+
+`EXPOSE` tells Docker and engineers what port the application intends to use. It is the application's declaration of its network interface. The actual networking — the iptables rule, the bridge, the veth — is created by `-p`. These are documented separately because they serve different purposes.
+
+---
+
+### On PID 1 as the Container's Contract
+
+`ps` inside the running container showed:
+
+```
+PID   USER     TIME  COMMAND
+    1 root      0:00 node app.js
+   19 root      0:00 sh
+   30 root      0:00 ps
+```
+
+PID 1 is the contract between the application and the container runtime. As long as PID 1 runs, the container runs. When PID 1 exits, the container exits. Docker does not decide when the container stops. The application does, by virtue of its PID 1 process either running or not.
+
+This explains every container lifetime observation from Phase 1 onward: `hello-world` exiting immediately, `nginx` running indefinitely, the broken container exiting with code 1. They are all the same mechanism: the container's lifetime is the PID 1 process's lifetime.
+
+---
+
+### On Image Tags as Mutable Pointers to Immutable Content
+
+`backend:broken` and `backend:v2` shared the same image ID because the Dockerfile was not saved before the rebuild. Docker compared the content of every layer. All were identical. Docker produced the same hash. It applied the new tag to the existing image.
+
+This is not an edge case. This is the design. Tags are names. Image IDs are identities. A name can be moved. An identity cannot. `backend:latest` in a CI/CD pipeline is a tag that moves forward with every build. The images themselves never change — they accumulate in the registry, each identified by their immutable hash, with the `latest` tag pointing to whichever is current.
+
+The Git analogy is exact: a branch name moves forward with each commit. The commits themselves are immutable. The branch is a mutable pointer to immutable content.
+
+---
+
+### On Docker as an Orchestrator of Linux Primitives
+
+The mental model at the start of Phase 1 was approximately: Docker is software that runs containers. By the end of Phase 2B, the model is more precise: Docker is software that calls Linux kernel APIs — `clone()` with namespace flags, `mount()` for overlay filesystems, `iptables` for packet routing — and manages the lifecycle of the resulting structures.
+
+The containers themselves are not Docker's invention. They are Linux process isolation, applied consistently and wrapped in a usable interface. Understanding this means that Docker problems that cannot be solved by reading Docker documentation can often be solved by reading Linux networking documentation. The two layers are separated by a thin abstraction that breaks predictably and in ways that are diagnosable when the underlying Linux model is understood.
+
+---
+
+## Phase 2B — Status
+
+Phase 2B is complete. Every major topic — Dockerfile engineering, image construction, layer cache, networking fundamentals, container runtime, failure analysis, storage model — was investigated, verified experimentally, and documented.
+
+The open investigation into `FROM node:22-alpine` Alpine tradeoffs carries forward to Phase 3, where multi-container deployment with Docker Compose will also resolve the MySQL connection failure observed throughout Phase 2B.

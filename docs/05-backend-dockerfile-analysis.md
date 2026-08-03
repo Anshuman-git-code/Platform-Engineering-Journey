@@ -2098,6 +2098,231 @@ The `257MB` figure represents the total uncompressed size of all layers in the i
 
 ---
 
+## Practical Validation — Engineering Command Reference
+
+### Purpose
+
+The following represents the complete set of engineering commands executed during Phase 2B to investigate, verify, and debug the backend image. Each entry documents what the command investigated and what it confirmed — not merely what it does syntactically.
+
+---
+
+### Image Construction
+
+```bash
+docker build -t backend:v1 .
+```
+
+**What it investigated:** Whether the Dockerfile correctly assembles a runnable image from the `api/` source directory.
+
+**What it confirmed:** All seven instructions executed successfully. The base image was pulled from Docker Hub and cached locally. Dependency installation completed inside a temporary container. All application source files were copied from the build context. The image `3f1bc0cd51ef` was produced and tagged `backend:v1`. Build context size was 5.224MB — confirming `.dockerignore` was not yet present and the full directory was transmitted.
+
+---
+
+### Layer History
+
+```bash
+docker history backend:v1
+```
+
+**What it investigated:** The complete layer stack of the image — both inherited layers from `node:22-alpine` and layers produced by this project's Dockerfile.
+
+**What it confirmed:**
+- The image contains 15 layers — 9 inherited from the Node base image, 6 produced by this Dockerfile
+- `EXPOSE` and `CMD` produce 0B layers — they are configuration metadata, not filesystem changes
+- `RUN npm install` produced the largest project layer at 15.3MB
+- `COPY . .` produced an 8.11MB layer containing application source
+- The Alpine base filesystem is 9.31MB; the Node runtime installation is 156MB
+- The `#(nop)` designation correctly identifies metadata-only instructions
+
+---
+
+### Image Metadata
+
+```bash
+docker inspect backend:v1
+```
+
+**What it investigated:** The complete image configuration JSON — everything Docker stores alongside the filesystem layers.
+
+**What it confirmed:**
+- Architecture is `arm64` — built on Apple Silicon, may not run on `amd64` without emulation
+- OS is `linux` — container runs on Linux (via Colima) regardless of the macOS host
+- `Config.Cmd` stores `["node", "app.js"]` as future-execution metadata, not a running process
+- `Config.Entrypoint` is `["docker-entrypoint.sh"]` — inherited from the Node base image, not written here
+- `Config.Env` contains `NODE_VERSION=22.23.2` and `YARN_VERSION=1.22.22` — inherited, not defined here
+- `Config.ExposedPorts` stores `5000/tcp` as documentation metadata with no operational effect
+- `Config.WorkingDir` is `/app` — the runtime working directory for all container processes
+- `RootFS.Layers` contains eight SHA256 hashes — the content-addressable references to each filesystem layer
+
+---
+
+### Container Runtime Without Port Publishing
+
+```bash
+docker run --name backend-test backend:v1
+```
+
+**What it investigated:** Whether the application starts correctly inside the container; whether the container is reachable from the host without port publishing.
+
+**What it confirmed:**
+- The server started: `🚀 Server running on http://0.0.0.0:5000`
+- The MySQL connection failed: `ECONNREFUSED 127.0.0.1:3306` — `localhost` inside the container resolves to the container's own loopback interface, where no MySQL process exists
+- The terminal remained occupied — PID 1 is alive and the container is running
+- The browser received `ERR_CONNECTION_REFUSED` — host namespace port 5000 has no registered process; no forwarding rule exists
+
+---
+
+### Container Runtime With Port Publishing
+
+```bash
+docker run -d --name backend-test -p 5000:5000 backend:v1
+```
+
+**What it investigated:** Whether Docker correctly installs a host-to-container forwarding rule and whether the application becomes reachable from the host.
+
+**What it confirmed:**
+- `docker ps` PORTS column changed from `5000/tcp` to `0.0.0.0:5000->5000/tcp` — the arrow confirms the forwarding rule is active
+- The browser received `Cannot GET /` — HTTP 404 — confirming the complete packet journey succeeded through host → bridge → veth → container → Node → Express
+- The 404 is expected and correct — the API has no route handler for `GET /`; the root path is not a defined endpoint
+
+---
+
+### Container Logs
+
+```bash
+docker logs backend-test
+```
+
+**What it investigated:** The application's startup output and runtime error state.
+
+**What it confirmed:**
+- Application startup sequence completed correctly
+- MySQL connection error persists regardless of port publishing — the two problems are independent: port publishing fixes host-to-container networking; the database connection requires a separate MySQL container on a shared network with DNS resolution
+
+---
+
+### Internal Container Inspection
+
+```bash
+docker exec -it backend-test sh
+```
+
+**What it investigated:** Whether the container's internal filesystem, runtime environment, and process state match the Dockerfile specification.
+
+Commands executed inside and what each confirmed:
+
+| Command | Confirmed |
+|---|---|
+| `pwd` | `WORKDIR /app` is active — shell opens in `/app` |
+| `ls` | `COPY . .` succeeded — all source files and `node_modules` present |
+| `node --version` | `FROM node:22-alpine` — Node v22.23.2 installed |
+| `printenv \| grep NODE` | `ENV NODE_VERSION=22.23.2` inherited from base image |
+| `cat /etc/os-release` | Container OS is Alpine Linux 3.24.1 — not macOS |
+| `ps` | PID 1 is `node app.js` — container lifecycle tied to this process |
+
+---
+
+### Container State Inspection
+
+```bash
+docker ps
+docker ps -a
+```
+
+**What it investigated:** The difference between running container state and all-container state; the relationship between PID 1 exit and container exit status.
+
+**What it confirmed:**
+- `docker ps` shows only containers with a running PID 1
+- `docker ps -a` shows all containers regardless of state — exited containers persist until explicitly removed with `docker rm`
+- `backend-test` (correct CMD) shows `Up` — PID 1 alive
+- `backend-broken` (wrong CMD) shows `Exited (1)` — PID 1 crashed, exit code 1 recorded
+- Stopping and removing a container does not affect the image — `docker images` confirms the image persists
+
+---
+
+### Image List
+
+```bash
+docker images
+```
+
+**What it investigated:** Local image storage, disk usage, and the relationship between tags and image IDs.
+
+**What it confirmed:**
+- `backend:v1` and `backend:broken` have different image IDs — different content
+- `backend:broken` and `backend:v2` have the same image ID — identical content produces identical hash; Docker applies the new tag to the existing image rather than creating a duplicate
+- Multiple tags can reference the same immutable image — tags are mutable pointers; image IDs are immutable identities
+
+---
+
+## Build Cache Validation
+
+### Engineering Problem
+
+A meaningful claim about layer cache requires more than theory — it requires experimental confirmation that Docker actually reuses layers when inputs are unchanged, and that the performance benefit is observable.
+
+### Investigation
+
+The backend image was rebuilt multiple times during Phase 2B. On all subsequent builds where source files had not changed, the following pattern was observed:
+
+```
+Step 1/7 : FROM node:22-alpine
+ ---> c610fcdfb1d5
+Step 2/7 : WORKDIR /app
+ ---> Using cache
+ ---> d90ce4a4e4e6
+Step 3/7 : COPY package*.json ./
+ ---> Using cache
+ ---> 3eecae2d38ff
+Step 4/7 : RUN npm install --only=production
+ ---> Using cache
+ ---> 22afe435dc5c
+Step 5/7 : COPY . .
+ ---> Using cache
+ ---> f9e913dc3cbc
+```
+
+`Using cache` appeared for every layer. The build completed in under one second. npm did not execute. No network requests were made.
+
+### What the Cache Validated
+
+**Layer identity is content-based, not timestamp-based.** Docker does not ask when the instruction was last run. It asks whether the input to that instruction has changed since the last time a matching layer was stored. For `COPY` instructions, the input is the file content. For `RUN` instructions, the input is the state of the filesystem at that point. If the content hash matches a stored layer, the layer is reused.
+
+**Instruction order is the primary cache optimisation lever.** The most expensive instruction in the Dockerfile — `RUN npm install` — was executed exactly once across all builds during Phase 2B. Every subsequent build served it from cache because `package.json` and `package-lock.json` never changed. The layer that would have required minutes to rebuild was instead served in milliseconds. This is the direct return on the engineering investment of placing `COPY package*.json ./` before `COPY . .`.
+
+**Cache invalidation propagates downward without exception.** When the broken build introduced a modified Dockerfile, `COPY . .` was invalidated (the Dockerfile is part of the build context and therefore part of the layer's input). Every layer after `COPY . .` was rebuilt — `EXPOSE` and `CMD` — even though those instructions themselves were unchanged. This is the rule: once a layer is invalidated, every subsequent layer rebuilds on top of a different parent, and must therefore be rebuilt regardless of its own instruction content.
+
+---
+
+## Phase 2B — Engineering Retrospective
+
+### What Was Built
+
+A complete, functional Docker image for the Node.js backend API. The image:
+
+- Starts from the official `node:22-alpine` base
+- Installs only production dependencies
+- Contains all application source code
+- Excludes credentials, host-compiled modules, version control history, and development artifacts via `.dockerignore`
+- Starts the Express server as PID 1 using exec-form CMD
+- Declares port 5000 as the application's network interface
+
+The image builds correctly, the container starts correctly, and the application serves traffic correctly when port publishing is configured. The only runtime limitation — MySQL connection refused — is by design: the backend is architected for multi-container deployment where the database runs as a separate service. That architecture is addressed in Phase 3 (Docker Compose).
+
+### What the Phase Proved
+
+**A successful build does not guarantee a runnable application.** The break/fix exercise demonstrated this directly. The image with `CMD ["node", "server.js"]` built without error. The container failed at runtime. The build phase and the runtime phase are independent concerns with independent failure modes.
+
+**Docker does not manage networking — Linux does.** Docker's port publishing, bridge network, and veth pairs are all Linux kernel operations that Docker orchestrates. The mental model of Docker as a virtual machine — managing its own networking stack independently — was replaced by the correct model: Docker is an orchestration layer that configures namespaces, iptables rules, and virtual network devices provided by the kernel.
+
+**The container is the application.** The entire image construction process — selecting the base image, ordering instructions for cache efficiency, excluding unnecessary files, installing only production dependencies — exists to produce a container that behaves identically in every environment. The Dockerfile is not configuration. It is the reproducibility specification for the application's execution environment.
+
+### What Remains Open
+
+The engineering tradeoffs of `FROM node:22-alpine` — specifically Alpine's use of musl libc versus glibc, the implications for native module compatibility, and the version selection rationale — were identified during this phase and deferred. This investigation is carried forward to Phase 3.
+
+---
+
 ## Current Status
 
 ### Completed
@@ -2146,14 +2371,14 @@ The `257MB` figure represents the total uncompressed size of all layers in the i
 | Docker storage model — content-addressable images | Complete |
 | Image tags vs image IDs | Complete |
 | Layer reuse across builds | Complete |
+| Practical validation — engineering command reference | Complete |
+| Build cache validation — experimental confirmation | Complete |
+| Phase 2B engineering retrospective | Complete |
 
-### Remaining — Phase 2B Closure
+### Phase 2B Status: Complete
 
-| Topic | Status |
-|---|---|
-| Engineering retrospective | Pending |
-| Git commit | Pending |
+Phase 2B is closed. The next phase is Phase 3 — Docker Compose and multi-container orchestration, where the MySQL connection failure observed in this phase is resolved by running all three tiers (React, Node, MySQL) as coordinated containers on a shared network with DNS-based service discovery.
 
 ### Open Investigation
 
-The engineering decisions behind `FROM node:22-alpine` — specifically version selection strategy and the Alpine Linux engineering tradeoffs (musl libc vs glibc, image size, available system packages) — remain identified and will be addressed in the engineering retrospective or Phase 3.
+The engineering decisions behind `FROM node:22-alpine` — specifically version selection strategy and the Alpine Linux engineering tradeoffs (musl libc vs glibc, image size, available system packages) — are carried forward to Phase 3.

@@ -248,3 +248,208 @@ Exec form executes the command directly as PID 1. The application receives signa
 ### Result
 
 `node app.js` runs as PID 1. The container stops when and only when the Node.js process exits. Signal handling works as the application expects.
+
+---
+
+## Phase 2B — Backend Containerization Decisions
+
+## Decision 12 — Use the official Node.js image rather than a generic Linux base
+
+### Context
+
+The backend requires Node.js, npm, and a Linux operating system. One approach is to start from a generic Linux base image (such as `ubuntu` or `alpine`) and install Node.js manually. The other is to start from the official `node` image maintained by the Node.js Docker team.
+
+### Decision
+
+Use `FROM node:22-alpine` — the official Node.js image — as the base for the backend image.
+
+### Reasoning
+
+The official Node.js image is built and maintained by the Node.js release team. It receives security patches on the same cadence as Node.js releases. It follows established conventions for filesystem layout and runtime configuration. The entrypoint, environment variables, and installed tooling are verified before publication.
+
+Starting from a generic Linux base and installing Node.js manually introduces maintenance burden with no corresponding benefit: the engineer becomes responsible for tracking Node.js security releases, installing the correct version for the target architecture, configuring the environment correctly, and keeping the installation current. The official image eliminates all of these concerns.
+
+### Result
+
+Base image provides a verified, maintained Node.js runtime. All subsequent instructions build on a known-good foundation.
+
+---
+
+## Decision 13 — Accept Alpine Linux as the base distribution
+
+### Context
+
+The `node` image is available in multiple Linux distribution variants: `node:22` (Debian Bookworm), `node:22-slim` (Debian minimal), and `node:22-alpine` (Alpine Linux). Each variant presents different tradeoffs.
+
+### Decision
+
+Use `node:22-alpine` for the backend image.
+
+### Reasoning
+
+Alpine Linux produces significantly smaller images than Debian variants. The Alpine base filesystem is approximately 9MB; the Debian equivalent is substantially larger. For a backend service deployed across multiple environments, image size directly affects pull times, registry storage costs, and deployment speed.
+
+### Tradeoffs
+
+Alpine uses musl libc rather than glibc. Some native Node.js modules that compile against glibc will fail to install or run on Alpine. The backend in this project uses `bcryptjs` (pure JavaScript, no native compilation) and `mysql2` (pure JavaScript driver). Neither requires glibc. Alpine is appropriate for this specific dependency set.
+
+If the backend were to introduce native modules that require glibc, the base image decision would need to be revisited. The tradeoff is documented here so that any future change to the dependency list is evaluated against this constraint.
+
+### Result
+
+Backend image is approximately 257MB total (including the Node runtime). A Debian-based image would be significantly larger for equivalent functionality.
+
+---
+
+## Decision 14 — Separate dependency manifest copy from application source copy
+
+### Context
+
+The Dockerfile must copy files from the build context and install npm dependencies. Both operations can be done in a single step (`COPY . .` followed by `RUN npm install`) or in two separate steps.
+
+### Decision
+
+Copy only `package.json` and `package-lock.json` first, run `npm install`, then copy all remaining source files.
+
+```dockerfile
+COPY package*.json ./
+RUN npm install --only=production
+COPY . .
+```
+
+### Reasoning
+
+Application source files change on every development iteration. Dependency manifests change only when a dependency is added, removed, or updated — which is infrequent relative to source changes.
+
+If source files and dependency manifests are copied together in a single step, any source file change invalidates the copy layer and therefore invalidates the `npm install` layer. npm reinstalls all packages on every build regardless of whether any dependency changed.
+
+Separating the two copy operations creates a stable layer boundary. The `npm install` layer is cached against the dependency manifest inputs. It is invalidated only when `package.json` or `package-lock.json` changes — not when application source changes.
+
+### Result
+
+`npm install` executes exactly once across all incremental source builds. Cache hits on the dependency layer reduce build time from minutes to seconds for the common case.
+
+---
+
+## Decision 15 — Install only production dependencies in the image
+
+### Context
+
+`package.json` declares both `dependencies` (runtime) and `devDependencies` (development tooling: linters, test runners, formatters, process managers).
+
+### Decision
+
+Use `npm install --only=production` (or `--omit=dev` in newer npm versions) to install only runtime dependencies.
+
+### Reasoning
+
+Development tooling has no function after deployment. Including it in the production image produces measurable harm:
+
+- **Image size**: development packages and their transitive dependencies add unnecessary storage overhead
+- **Attack surface**: every package in the image is a potential vulnerability; packages that perform no runtime function should not be present
+- **Dependency graph**: development packages introduce their own transitive dependencies, none of which are needed for the application to operate
+
+The production image should contain exactly what is required to run the application. Every package excluded is a package that cannot be exploited and does not increase storage cost.
+
+### Result
+
+Image contains 99 production packages. Development tooling is absent from the production image.
+
+---
+
+## Decision 16 — Treat .dockerignore as a security boundary, not an optimisation
+
+### Context
+
+`COPY . .` copies the entire build context into the image. The `api/` directory contains files that must not be in the image: `node_modules/` (host-compiled, OS-incompatible), `.env` (live credentials), `.git/` (version control history), and macOS metadata files.
+
+### Decision
+
+Create `.dockerignore` before executing the first build and treat it as a required security control, not an optional performance enhancement.
+
+### Reasoning
+
+The consequences of omitting `.dockerignore` are not uniform. They span two distinct risk categories:
+
+**Correctness risk**: `node_modules/` compiled on macOS contains binaries built for the macOS architecture and system libraries. Copying them into a Linux container causes native modules to fail at runtime. The image may build successfully and produce a container that fails in ways that are difficult to diagnose.
+
+**Security risk**: `.env` contains the database password and JWT secret. Once embedded in an image layer, credentials are permanently part of that image. They cannot be removed by deleting the `.env` file — the layer is immutable. Anyone with access to the image can extract the credentials. If the image is pushed to a registry, the credentials become accessible to anyone who can pull it.
+
+The `.env` exclusion is not a convenience. It is a requirement for any image that may be stored in or distributed via a registry.
+
+### Result
+
+Build context excludes host-compiled modules, credentials, version control history, and OS metadata. Image layers contain only application code and Linux-compiled dependencies.
+
+---
+
+## Decision 17 — Use exec-form CMD for application startup
+
+### Context
+
+Docker's `CMD` instruction supports two forms:
+- Shell form: `CMD node app.js` — executed as `/bin/sh -c "node app.js"`
+- Exec form: `CMD ["node", "app.js"]` — executed directly
+
+### Decision
+
+Use exec form: `CMD ["node", "app.js"]`.
+
+### Reasoning
+
+Shell form makes `/bin/sh` PID 1. The Node.js process becomes a child of the shell. OS signals sent to the container — including `SIGTERM` for graceful shutdown — are delivered to the shell process, not to the application. The shell may not forward signals to its children. Graceful shutdown logic implemented in the Node.js application is bypassed. The container is forcibly killed after the timeout rather than shutting down cleanly.
+
+Exec form makes `node` the direct PID 1 (the entrypoint script ultimately `exec`s the Node process). Signals are delivered to the application. Graceful shutdown works as intended. The container lifecycle is tied directly and transparently to the application process.
+
+### Result
+
+`node app.js` receives OS signals correctly. Container shutdown is clean. Container lifetime is transparently tied to the application process.
+
+---
+
+## Decision 18 — Treat EXPOSE as documentation, not networking configuration
+
+### Context
+
+The backend API listens on port 5000. The Dockerfile includes `EXPOSE 5000`. It would be reasonable to assume this instruction makes the port accessible.
+
+### Decision
+
+Treat `EXPOSE` as metadata documentation only. Never rely on it for networking configuration.
+
+### Reasoning
+
+`EXPOSE` performs no kernel operations. It does not call `bind()`, install iptables rules, or register any entry in the host port table. It records the application's intended listening port in the image configuration JSON, where it is readable by engineers and by orchestration tools such as Kubernetes.
+
+The application becomes reachable only when an explicit port publishing rule exists — either `-p` at runtime or a `ports` mapping in Docker Compose. That rule installs forwarding entries in the host networking stack. `EXPOSE` is the declaration of intent. `-p` is the implementation.
+
+Understanding this distinction prevents a class of debugging errors where an application appears to be configured correctly because `EXPOSE` is present, but is unreachable because no publishing rule exists.
+
+### Result
+
+Port publishing is always specified explicitly at runtime. The networking intent is documented in the Dockerfile via `EXPOSE`. These are treated as independent concerns.
+
+---
+
+## Decision 19 — Separate runtime debugging from image construction investigation
+
+### Context
+
+Phase 2B involved both image construction (Dockerfile analysis, build process, layer inspection) and runtime behavior (container execution, port publishing, process inspection, failure analysis).
+
+### Decision
+
+Treat image construction and runtime debugging as distinct engineering domains requiring separate mental models and separate diagnostic tools.
+
+### Reasoning
+
+Image construction problems manifest during `docker build`. Runtime problems manifest during `docker run`. The failure signatures are completely different:
+
+- A build failure means the image was not produced. The fix lives in the Dockerfile or the build context.
+- A runtime failure means the image was produced but the container did not behave as expected. The fix may lie in the CMD, in missing environment variables, in network configuration, or in the application logic itself.
+
+Conflating the two leads to searching for build-time fixes for runtime problems and vice versa. The layered debugging model — image/build, container runtime, networking, application logic, external services — provides the framework for isolating which domain contains the failure.
+
+### Result
+
+Build failures and runtime failures were consistently diagnosed at the correct layer throughout Phase 2B. No time was spent modifying the Dockerfile in response to application logic failures, and no time was spent debugging networking when the issue was in the CMD instruction.
