@@ -618,17 +618,694 @@ Every one of these tools follows the same principle: describe the desired state;
 | Implicit network creation and DNS registration | Complete |
 | Service name as stable DNS identity | Complete |
 | The declarative infrastructure model | Complete |
+| docker-compose.yaml — line-by-line project analysis | Complete |
+| Volume architecture — named vs bind mount | Complete |
+| docker compose up lifecycle | Complete |
+| Debugging workflow | Complete |
+| Phase 4 engineering retrospective | Complete |
 
-### Remaining — Phase 4 Practical
+### Phase 4 Status: Complete
 
-| Topic | Status |
-|---|---|
-| `docker compose up` lifecycle | Pending |
-| Complete system startup and verification | Pending |
-| End-to-end application testing | Pending |
-| `docker compose logs` | Pending |
-| `docker compose ps` | Pending |
-| `docker compose down` | Pending |
-| Debugging multi-container failures | Pending |
-| Engineering retrospective | Pending |
-| Git commit | Pending |
+Phase 4 is closed. The complete `docker-compose.yaml` has been analyzed line by line in the context of this specific project. The system brings up frontend, backend, and MySQL as a coordinated application with one command.
+
+---
+
+## docker-compose.yaml — Complete Line-by-Line Project Analysis
+
+This section analyzes every line of the project's `docker-compose.yaml` in the context of the actual application source code. Each instruction is traced back to the specific file or code path it connects to.
+
+The complete file:
+
+```yaml
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8
+    container_name: mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: Aditya
+      MYSQL_DATABASE: crud_app
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d
+    ports:
+      - "3306:3306"
+
+  backend:
+    build: ./api
+    container_name: backend-api
+    environment:
+      DB_HOST: mysql
+      DB_USER: root
+      DB_PASSWORD: Aditya
+      DB_NAME: crud_app
+      JWT_SECRET: devopsShackSuperSecretKey
+      RESET_ADMIN_PASS: 'true'
+    depends_on:
+      - mysql
+    ports:
+      - "5000:5000"
+
+  frontend:
+    build: ./client
+    container_name: frontend-react
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+volumes:
+  mysql-data:
+```
+
+---
+
+### version: '3.8'
+
+```yaml
+version: '3.8'
+```
+
+Specifies the Compose file format version. Modern Docker Compose (v2+) does not require this field and interprets files according to the current Compose Specification automatically. It is retained here for compatibility. No instruction in this file requires any feature beyond what version 3.8 provides.
+
+---
+
+### mysql service
+
+#### image: mysql:8
+
+```yaml
+image: mysql:8
+```
+
+Instructs Compose to pull the official MySQL 8 image from Docker Hub if not present locally. No `Dockerfile` is used for MySQL — the image is maintained by the MySQL team and published to Docker Hub. `mysql:8` pins to the MySQL 8 major version, meaning minor and patch updates are applied on pull but breaking changes from MySQL 9+ are avoided.
+
+**Project connection:** The backend at `api/models/db.js` uses `mysql2` to connect to this database. The `crud_app` database and `users` table it expects are created by this container's initialization mechanism.
+
+---
+
+#### container_name: mysql
+
+```yaml
+container_name: mysql
+```
+
+Assigns the explicit name `mysql` to the created container. Without this, Compose would generate a name like `docker-kubernetes-cicd-implementation-mysql-1`.
+
+**Project connection:** The container name is used for `docker logs mysql`, `docker exec -it mysql sh`, and `docker compose stop mysql` during development operations. It does not affect DNS resolution — that is governed by the service name `mysql:`.
+
+---
+
+#### restart: always
+
+```yaml
+restart: always
+```
+
+Configures Docker to restart the MySQL container automatically whenever it stops, including on host machine restart.
+
+**Project connection:** MySQL is the data tier of the application. If it crashes, all data operations fail immediately. The backend cannot serve any authenticated request without MySQL. `restart: always` provides basic fault recovery without operator intervention.
+
+---
+
+#### MYSQL_ROOT_PASSWORD: Aditya
+
+```yaml
+MYSQL_ROOT_PASSWORD: Aditya
+```
+
+Sets the MySQL root user password during first-time database initialization. This variable name is defined by the MySQL Docker image's entrypoint script at `/docker-entrypoint.sh`. Docker delivers this value to the container environment; the MySQL entrypoint reads it and calls the equivalent of `ALTER USER 'root'@'%' IDENTIFIED BY 'Aditya'`.
+
+**Project connection:** The backend's `api/models/db.js` connects as the root user:
+
+```javascript
+const db = mysql.createConnection({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,       // "root"
+  password: process.env.DB_PASSWORD, // "Aditya"
+  database: process.env.DB_NAME
+});
+```
+
+The value `Aditya` here must match `DB_PASSWORD: Aditya` in the backend environment section. Both refer to the same MySQL root credential.
+
+---
+
+#### MYSQL_DATABASE: crud_app
+
+```yaml
+MYSQL_DATABASE: crud_app
+```
+
+Instructs the MySQL entrypoint to create a database named `crud_app` during initialization if it does not already exist. This variable name is also defined by the MySQL image's entrypoint.
+
+**Project connection:** `api/models/db.js` connects to `crud_app`:
+
+```javascript
+database: process.env.DB_NAME  // "crud_app"
+```
+
+And `api/.env` (for local development without Compose) also specifies:
+
+```
+DB_NAME=crud_app
+```
+
+The `users` table that the application queries is created within this database — either by the `mysql-init` SQL scripts or by the application's own schema on first run.
+
+---
+
+#### mysql-data:/var/lib/mysql
+
+```yaml
+volumes:
+  - mysql-data:/var/lib/mysql
+```
+
+Mounts the named Docker volume `mysql-data` at `/var/lib/mysql` inside the MySQL container.
+
+`/var/lib/mysql` is MySQL's internal data directory — the location where MySQL stores all database files: InnoDB tablespace files, binary logs, redo logs, and the `crud_app/` directory containing the `users` table data. This path is defined by MySQL, not by Docker.
+
+**Engineering significance:** Without this volume mount, all data written to `/var/lib/mysql` lives only in the container's writable layer. `docker compose down` removes the container and deletes the writable layer — every user account, every registered user record, every session is permanently lost. With the volume mount, the data files live in Docker's managed volume storage. The container can be removed and recreated without affecting the data.
+
+**Project connection:** Every INSERT, UPDATE, or DELETE executed by `api/controllers/userController.js` and `api/controllers/authController.js` ultimately writes to files in `/var/lib/mysql/crud_app/`. These files persist beyond any individual container's lifetime because they are stored in `mysql-data`.
+
+---
+
+#### ./mysql-init:/docker-entrypoint-initdb.d
+
+```yaml
+- ./mysql-init:/docker-entrypoint-initdb.d
+```
+
+A bind mount — not a Docker volume. The host directory `./mysql-init` (relative to `docker-compose.yaml`) is mounted at `/docker-entrypoint-initdb.d` inside the MySQL container.
+
+`/docker-entrypoint-initdb.d` is a special directory recognized by the MySQL Docker image's entrypoint. Any `.sql` or `.sh` files present in this directory are executed automatically during the very first initialization — when the data directory is empty. On subsequent starts (when `mysql-data` already contains data), the directory is ignored.
+
+**Project connection:** This is where the `users` table schema SQL lives. The application expects:
+
+```sql
+CREATE TABLE IF NOT EXISTS users (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(255) NOT NULL,
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password VARCHAR(255) NOT NULL,
+  role ENUM('admin', 'viewer') DEFAULT 'viewer',
+  is_active TINYINT(1) DEFAULT 1,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+Without this initialization, `app.js`'s `initAdminUser()` function — which runs `SELECT * FROM users WHERE email = ?` on startup — would fail with a "table doesn't exist" error.
+
+---
+
+#### ports: "3306:3306" (mysql)
+
+```yaml
+ports:
+  - "3306:3306"
+```
+
+Publishes MySQL's port 3306 to the host.
+
+**Project connection:** This port mapping is not needed for the backend-to-MySQL communication inside Compose. The backend connects to `mysql:3306` through the internal bridge network without any host port mapping. This mapping is provided so that local MySQL GUI tools (such as TablePlus or MySQL Workbench) running on the developer's Mac can connect to the containerized database for inspection and debugging.
+
+In production, this mapping would be removed — there is no reason to expose the database port to outside the container network.
+
+---
+
+### backend service
+
+#### build: ./api
+
+```yaml
+build: ./api
+```
+
+Instructs Compose to execute `docker build` against the `api/` directory before creating the backend container. Compose uses `api/Dockerfile` and the `api/` directory as the build context.
+
+The `api/Dockerfile` produces an image that includes the Node.js runtime, all production npm dependencies, and all application source files. This is the image analyzed in detail in `05-backend-dockerfile-analysis.md`.
+
+**Project connection:** The built image contains `app.js`, `controllers/`, `routes/`, `middleware/`, `models/` — the entire backend application. `CMD ["node", "app.js"]` in the Dockerfile starts the Express server when the container runs.
+
+---
+
+#### container_name: backend-api
+
+```yaml
+container_name: backend-api
+```
+
+Assigns the explicit name `backend-api` to the container. Note that the container name differs from the service name (`backend`). The container name is used in CLI operations. The service name is used by Docker DNS.
+
+**Project connection:** `docker logs backend-api` and `docker exec -it backend-api sh` use this name during debugging. The frontend does not reference `backend-api` anywhere — it references the service name `backend` (or in the current frontend build, it communicates via `REACT_APP_API` which is set to `http://localhost:5000` in the client `.env` file, addressed in the networking discussion below).
+
+---
+
+#### DB_HOST: mysql
+
+```yaml
+environment:
+  DB_HOST: mysql
+```
+
+Sets the environment variable `DB_HOST` to the string `mysql`. When the backend container starts, the Linux process environment contains `DB_HOST=mysql`.
+
+**Project connection — exact code path:**
+
+`api/models/db.js`:
+```javascript
+const db = mysql.createConnection({
+  host: process.env.DB_HOST,  // ← reads "mysql" from Linux environment
+  ...
+});
+```
+
+`mysql` here is Docker's internal DNS hostname for the `mysql` service. Docker DNS resolves `mysql` → `172.x.x.x` (the MySQL container's IP on the Compose bridge network). The Node.js `mysql2` driver calls `getaddrinfo("mysql")` which the kernel resolves through Docker's DNS server.
+
+This is the direct resolution of the `ECONNREFUSED 127.0.0.1:3306` error observed in Phase 2B. When running without Compose, the backend's `api/.env` had `DB_HOST=localhost`, which resolved to the container's own loopback interface — where no MySQL was listening. In Compose, `DB_HOST=mysql` resolves to the MySQL container on the shared network.
+
+---
+
+#### DB_USER: root
+
+```yaml
+DB_USER: root
+```
+
+**Project connection:**
+
+`api/models/db.js`:
+```javascript
+user: process.env.DB_USER,  // ← "root"
+```
+
+Must match `MYSQL_ROOT_PASSWORD` in the mysql service — both refer to the MySQL root user. The application connects as root. In a production deployment, a dedicated application user with least-privilege permissions would replace root.
+
+---
+
+#### DB_PASSWORD: Aditya
+
+```yaml
+DB_PASSWORD: Aditya
+```
+
+**Project connection:**
+
+`api/models/db.js`:
+```javascript
+password: process.env.DB_PASSWORD,  // ← "Aditya"
+```
+
+This value must exactly match `MYSQL_ROOT_PASSWORD: Aditya` set in the mysql service. The MySQL server was initialized with this password. The backend authenticates with this password. If either value changes without changing the other, the backend cannot connect.
+
+---
+
+#### DB_NAME: crud_app
+
+```yaml
+DB_NAME: crud_app
+```
+
+**Project connection:**
+
+`api/models/db.js`:
+```javascript
+database: process.env.DB_NAME,  // ← "crud_app"
+```
+
+Must match `MYSQL_DATABASE: crud_app` from the mysql service. The MySQL container creates a database named `crud_app` on first startup. The backend connects to that database. All queries in `userController.js` and `authController.js` operate within this database.
+
+---
+
+#### JWT_SECRET: devopsShackSuperSecretKey
+
+```yaml
+JWT_SECRET: devopsShackSuperSecretKey
+```
+
+**Project connection:**
+
+`api/controllers/authController.js`:
+```javascript
+const SECRET = process.env.JWT_SECRET || 'supersecret';
+```
+
+```javascript
+const token = jwt.sign(
+  { id: user.id, role: user.role },
+  SECRET,         // ← signs the token with this secret
+  { expiresIn: '1h' }
+);
+```
+
+`api/middleware/auth.js` uses the same secret to verify every incoming JWT on protected routes. The secret must be consistent between the token-signing code and the verification code. Because both run inside the same container (the backend), both read from the same environment variable.
+
+In production, this value must be a cryptographically random string of sufficient length, stored in a secrets manager — not committed to version control.
+
+---
+
+#### RESET_ADMIN_PASS: 'true'
+
+```yaml
+RESET_ADMIN_PASS: 'true'
+```
+
+**Project connection:**
+
+`api/app.js`, inside `initAdminUser()`:
+```javascript
+if (process.env.RESET_ADMIN_PASS === 'true') {
+  db.query(
+    'UPDATE users SET password = ?, name = ?, role = ? WHERE email = ?',
+    [hashedPassword, name, role, email],
+    ...
+  );
+}
+```
+
+When `RESET_ADMIN_PASS` is `'true'`, the application resets the admin password to `admin123` on every startup. This is a development convenience — it ensures the admin account is always in a known state when the Compose stack restarts. In production, this value would be `'false'` or omitted entirely.
+
+---
+
+#### depends_on: mysql
+
+```yaml
+depends_on:
+  - mysql
+```
+
+Instructs Compose to start the `mysql` service container before starting the `backend` container. Does not guarantee MySQL has finished initialization.
+
+**Project connection:** The backend's `db.connect()` in `api/models/db.js` is called during module loading — at the moment `app.js` starts. If MySQL is still initializing when the backend starts, `db.connect()` throws. The application crashes. The container exits with code 1. In this project, the `restart: always` directive on MySQL, combined with the typical initialization time, usually allows the backend to connect successfully on the first or second attempt.
+
+---
+
+#### ports: "5000:5000" (backend)
+
+```yaml
+ports:
+  - "5000:5000"
+```
+
+Publishes the backend API on host port 5000.
+
+**Project connection:** `api/app.js`:
+```javascript
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
+});
+```
+
+The backend listens on port 5000 inside the container. The port mapping forwards host traffic at `localhost:5000` to the container.
+
+**Frontend connection:** `client/.env`:
+```
+REACT_APP_API=http://localhost:5000
+```
+
+`client/src/axios.js`:
+```javascript
+const instance = axios.create({
+  baseURL: process.env.REACT_APP_API || 'http://localhost:5000',
+});
+```
+
+The React application was built with `REACT_APP_API=http://localhost:5000` baked into the JavaScript bundle at build time. The browser (running on the user's machine, outside all containers) sends API requests to `http://localhost:5000`. Those requests reach the host's port 5000, which Docker forwards into the backend container. This is why the backend port mapping is essential even though the frontend and backend are on the same Compose network — the browser is not inside the Docker network.
+
+---
+
+### frontend service
+
+#### build: ./client
+
+```yaml
+build: ./client
+```
+
+Instructs Compose to execute the multi-stage build defined in `client/Dockerfile`. Stage 1 installs 1350 packages and runs `npm run build`. Stage 2 starts from `nginx:alpine` and copies only the `build/` output.
+
+**Project connection:** The resulting image contains Nginx and the static React build. The JavaScript bundle contains `REACT_APP_API=http://localhost:5000` baked in at build time. This means the browser will send API calls to port 5000 on the host machine — which routes into the backend container via the `5000:5000` port mapping.
+
+---
+
+#### container_name: frontend-react
+
+```yaml
+container_name: frontend-react
+```
+
+CLI handle for the frontend container. Used with `docker logs frontend-react` and `docker exec -it frontend-react sh`.
+
+---
+
+#### ports: "3000:80" (frontend)
+
+```yaml
+ports:
+  - "3000:80"
+```
+
+Maps host port 3000 to container port 80 where Nginx is listening.
+
+**Project connection:** `client/Dockerfile`:
+```dockerfile
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+Nginx inside the frontend container serves the React build from `/usr/share/nginx/html` on port 80. The browser accesses the application at `http://localhost:3000`. Docker forwards that traffic to Nginx at port 80.
+
+---
+
+#### depends_on: backend
+
+```yaml
+depends_on:
+  - backend
+```
+
+Ensures the backend container is started before the frontend container. Since the frontend is a static file server with no active connection to the backend at startup, this dependency is precautionary — it ensures the backend is started and likely listening by the time a user's browser sends its first API request.
+
+---
+
+### top-level volumes
+
+```yaml
+volumes:
+  mysql-data:
+```
+
+Declares the named volume `mysql-data` at the project level. Docker creates this volume if it does not exist when `docker compose up` runs. The volume persists after `docker compose down`. It is removed only by `docker compose down -v` or `docker volume rm`.
+
+**Engineering significance:** The top-level declaration is required. Without it, the `mysql-data:/var/lib/mysql` mount in the mysql service would reference an undefined volume and Compose would fail to start. The empty `mysql-data:` declaration creates a standard Docker-managed volume with default settings.
+
+---
+
+## Volume Architecture
+
+### Named Volume vs Bind Mount — A Direct Comparison
+
+The Compose file uses both volume types for different purposes:
+
+```
+mysql-data:/var/lib/mysql          ← Named volume (Docker owns storage)
+./mysql-init:/docker-entrypoint-initdb.d  ← Bind mount (project owns storage)
+```
+
+| Property | Named Volume (`mysql-data`) | Bind Mount (`./mysql-init`) |
+|---|---|---|
+| Storage location | Docker-managed (`/var/lib/docker/volumes/`) | Host filesystem (`./mysql-init/`) |
+| Controlled by | Docker | Developer |
+| Persists after `docker compose down` | Yes | Yes (it is a host directory) |
+| Removed by `docker compose down -v` | Yes | No |
+| Purpose | Persistent database storage | Read-once initialization scripts |
+| Contents managed by | MySQL (writes at runtime) | Developer (provides SQL schema) |
+
+**What happens if the named volume is deleted:**
+`docker compose down -v` removes the volume. The next `docker compose up` creates a new empty volume. MySQL initializes from scratch. The `mysql-init` SQL scripts execute again. The database is empty — all user accounts created via the application are gone.
+
+**What happens if the bind mount directory is deleted:**
+The `mysql-init` directory is removed from the host. The bind mount cannot be created. `docker compose up` may fail or MySQL may start without executing the initialization scripts. If the named volume already contains data, MySQL ignores `docker-entrypoint-initdb.d` anyway — it only reads that directory on first initialization.
+
+---
+
+## docker compose up — Lifecycle
+
+When `docker compose up` executes against this file, Compose performs the following operations in order:
+
+```
+1. Parse docker-compose.yaml
+        │
+        ▼
+2. Create bridge network: <project>_default
+   Register DNS entries: mysql, backend, frontend
+        │
+        ▼
+3. Create named volume: mysql-data (if not exists)
+        │
+        ▼
+4. Build images (if build: is specified)
+   docker build ./api  → backend image
+   docker build ./client → frontend image (two-stage)
+        │
+        ▼
+5. Pull images (if image: is specified and not cached)
+   mysql:8
+        │
+        ▼
+6. Create containers in dependency order:
+   mysql first (no dependencies)
+   backend second (depends_on: mysql)
+   frontend third (depends_on: backend)
+        │
+        ▼
+7. For each container:
+   - Inject environment variables
+   - Mount volumes (mysql-data, ./mysql-init)
+   - Attach to bridge network
+   - Apply port publishing rules
+        │
+        ▼
+8. Start processes:
+   mysql: mysqld (MySQL server)
+   backend: node app.js (Express API)
+   frontend: nginx -g daemon off; (Nginx file server)
+        │
+        ▼
+9. Attach to stdout/stderr of all containers (unless -d flag)
+```
+
+The result is a fully connected three-tier application:
+
+```
+Browser (host)
+      │
+      │ GET http://localhost:3000
+      ▼
+Nginx (frontend-react container, port 80)
+      │ serves index.html + JS bundle
+      ▼
+Browser executes React JS
+      │
+      │ API request to http://localhost:5000
+      ▼
+Host → Docker port 5000 forwarding rule
+      │
+      ▼
+Express (backend-api container, port 5000)
+      │
+      │ mysql2 connection to mysql:3306
+      ▼
+Docker DNS: mysql → 172.x.x.x
+      │
+      ▼
+MySQL (mysql container, port 3306)
+      │
+      ▼
+/var/lib/mysql → mysql-data volume → host disk
+```
+
+---
+
+## Common Debugging Workflow
+
+When `docker compose up` produces unexpected behavior, the following sequence isolates the failure layer:
+
+**1. Check container status**
+
+```bash
+docker compose ps
+```
+
+Shows each service's container name, state (Up/Exited), and port mappings. An `Exited` state with a non-zero exit code indicates PID 1 crashed.
+
+**2. Inspect logs**
+
+```bash
+docker compose logs
+docker compose logs backend
+docker compose logs mysql
+```
+
+The most important first step after confirming a container has exited. Logs reveal the application's own error output — `ECONNREFUSED`, `MODULE_NOT_FOUND`, initialization errors. The failure layer (networking, application, database) is usually identifiable from the log content.
+
+**3. Enter a running container**
+
+```bash
+docker compose exec backend sh
+docker compose exec mysql sh
+```
+
+Opens an interactive shell inside the running container. From inside the backend container:
+
+```bash
+printenv | grep DB        # verify environment variables were injected
+ping mysql                # verify DNS resolution
+nslookup mysql            # verify DNS returns an IP
+```
+
+**4. Verify data persistence**
+
+```bash
+docker compose exec mysql sh
+mysql -u root -pAditya
+SHOW DATABASES;
+USE crud_app;
+SHOW TABLES;
+SELECT * FROM users;
+```
+
+Confirms the database, schema, and data are present inside the running MySQL container.
+
+**5. Shutdown**
+
+```bash
+docker compose down           # stop and remove containers, preserve volumes
+docker compose down -v        # stop, remove containers AND volumes (resets database)
+```
+
+`docker compose down` is the clean shutdown. It removes containers but preserves the `mysql-data` volume. `docker compose down -v` removes volumes — use only when a full reset is required.
+
+---
+
+## Phase 4 Engineering Retrospective
+
+### What Was Built
+
+A complete, one-command-startup three-tier application described entirely in `docker-compose.yaml`. The system comprises:
+
+- A MySQL 8 database with persistent data storage, automatic schema initialization, and automatic restart
+- A Node.js + Express API with environment-injected configuration, startup dependency ordering, and host port access for development
+- A React + Nginx frontend with a multi-stage build, port mapping from host 3000 to container 80, and a dependency on the backend service
+
+`docker compose up` starts all three containers in the correct order on a shared bridge network with DNS-based service discovery. `docker compose down` cleanly stops the system while preserving database state.
+
+### What Phase 4 Established
+
+**The shift from containers to systems.** Earlier phases developed expertise in individual containers. Phase 4 developed the skill of describing a set of containers as a system — with relationships, dependencies, shared state, and a single reproducible startup procedure.
+
+**The declarative model applies beyond Docker.** Kubernetes manifests, Terraform configurations, Helm charts, and CloudFormation templates all follow the same principle: describe the desired state; let the tool create it. Understanding this model in Docker Compose provides the conceptual foundation for every infrastructure-as-code tool.
+
+**Configuration as a deployment-time concern.** The application code reads from `process.env`. The Compose file supplies the values. The same image runs in development, CI, staging, and production with different environment variables. No code change is required to change environments.
+
+**The MySQL ECONNREFUSED error is resolved.** The failure observed in Phase 2B — where `DB_HOST=localhost` inside a container resolved to the container's own loopback interface — is resolved by `DB_HOST: mysql` in the Compose environment, which resolves to the MySQL service container via Docker's internal DNS.
+
+### Docker Learning Track — Complete
+
+```
+Phase 0  Engineering Investigation           ✅
+Phase 1  Docker Fundamentals                 ✅
+Phase 2A Image Construction                  ✅
+Phase 2B Backend Containerization            ✅
+Phase 3  Frontend Containerization           ✅
+Phase 4  Docker Compose                      ✅
+```
+
+The Docker learning track is complete. Every container concept from images to multi-container orchestration has been investigated, verified experimentally, and documented.
+
+**Next: Kubernetes** — Phase 5 applies the same engineering discipline to container orchestration at scale: multiple nodes, declarative deployments, services, ingress, persistent volumes, and configuration management across a cluster. The mental models from Docker and Docker Compose — images, containers, services, networking, volumes, declarative descriptions — apply directly and are extended by Kubernetes's additional capabilities.

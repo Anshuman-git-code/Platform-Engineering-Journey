@@ -504,3 +504,63 @@ The named volume `mysql-data` exists independently of the MySQL container. It wa
 ## Phase 4 — Status
 
 Phase 4 conceptual analysis is complete. The `docker-compose.yml` has been fully analyzed: services, image vs build, container names, restart policies, environment variables, volumes, ports, depends_on, and implicit networking. The practical phase — `docker compose up`, system verification, debugging, and retrospective — continues in the next session.
+
+---
+
+## Phase 4 — Compose Practical and Retrospective
+
+### On Tracing Environment Variables Back to Application Code
+
+Documenting the Compose file line by line against the actual source code made something concrete that had previously been abstract: every environment variable in the Compose file has a precise destination in the application.
+
+`DB_HOST: mysql` → `process.env.DB_HOST` → `mysql.createConnection({ host: ... })` in `api/models/db.js`.
+
+`JWT_SECRET: devopsShackSuperSecretKey` → `process.env.JWT_SECRET` → `jwt.sign(..., SECRET, ...)` in `api/controllers/authController.js`.
+
+`RESET_ADMIN_PASS: 'true'` → `process.env.RESET_ADMIN_PASS === 'true'` → the admin password reset branch in `api/app.js`.
+
+These are not Docker features. Docker delivers the values. The application was written to read from `process.env`. The Compose file provides the values. Three separate engineering concerns — infrastructure, application code, and configuration — each do their part without crossing into each other's domain.
+
+---
+
+### On the Browser Being Outside the Container Network
+
+The frontend connect issue clarified the networking model precisely.
+
+The React application is built with `REACT_APP_API=http://localhost:5000` baked into the JavaScript bundle. The browser downloads that bundle and executes it on the user's machine. The user's machine is not inside the Docker bridge network. When the browser calls `http://localhost:5000`, it is making a request to the host machine's port 5000 — which Docker forwards into the backend container.
+
+This means: for browser-initiated API requests to work in a Compose setup, the backend port must be published to the host (`5000:5000`). The internal Compose network is irrelevant for browser traffic. The browser is a client outside the network.
+
+This would change in a Kubernetes deployment with an ingress controller — or in a Compose setup with Nginx acting as a reverse proxy, where all traffic enters through a single host port and Nginx routes internally. For this project's development setup, the separate port mappings are the correct approach.
+
+---
+
+### On mysql-init as Infrastructure as Code at a Smaller Scale
+
+The bind mount `./mysql-init:/docker-entrypoint-initdb.d` is a small but precise example of infrastructure as code at the data layer.
+
+The database schema — the `users` table definition — exists as a SQL file in the repository. When the MySQL container starts for the first time, it executes that file automatically. A new developer who clones the repository and runs `docker compose up` gets a fully initialized database with the correct schema. They do not read documentation about which tables to create. The infrastructure creates itself from the code.
+
+This is the same principle as Compose itself, applied one level deeper. The SQL file is version-controlled. Schema changes are tracked. The initialization is reproducible.
+
+---
+
+### On Phase 4 Completing the Docker Mental Model
+
+Looking back across the phases:
+
+Phase 1 established that Docker is an orchestration layer over Linux kernel primitives — namespaces, iptables, overlay filesystems. A container is a process in an isolated namespace, not a virtual machine.
+
+Phase 2B established that a Dockerfile is a reproducibility specification for an execution environment. Every instruction is an engineering decision with a reason.
+
+Phase 3 established that not all containerization problems are the same. A compiler and a server have different relationships to the code they process. Multi-stage builds are the architectural consequence of that difference.
+
+Phase 4 established that services are stable logical identities for replaceable container instances. A system is described declaratively. Configuration is injected at deployment time. Data that must outlive containers lives in volumes.
+
+The complete mental model: source code → image → container → service → system. Each layer has its own concerns, its own tools, and its own failure modes. Understanding each layer independently is what enables debugging across layers when they interact.
+
+---
+
+## Docker Track — Status: Complete
+
+All Docker phases are complete. The engineering foundation is established for Kubernetes, where the same concepts — images, containers, services, networking, volumes, declarative descriptions — are extended to multi-node cluster management at production scale.
