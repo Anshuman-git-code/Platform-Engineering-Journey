@@ -453,3 +453,97 @@ Conflating the two leads to searching for build-time fixes for runtime problems 
 ### Result
 
 Build failures and runtime failures were consistently diagnosed at the correct layer throughout Phase 2B. No time was spent modifying the Dockerfile in response to application logic failures, and no time was spent debugging networking when the issue was in the CMD instruction.
+
+---
+
+## Phase 3 — Frontend Containerization Decisions
+
+## Decision 20 — Use a multi-stage build for the frontend image
+
+### Context
+
+The React frontend requires Node.js, npm, and all development dependencies to build. It requires only Nginx and the static build output to run. These two requirement sets share no components.
+
+### Decision
+
+Use a two-stage Dockerfile: Stage 1 (builder) installs dependencies and runs the build tool; Stage 2 (runtime) starts from a clean Nginx image and copies only the build output.
+
+### Reasoning
+
+A single-stage Dockerfile that satisfies both requirements would include Node.js, npm, `node_modules` (~300MB), and React source code in the production image. None of these are needed at runtime. They increase image size, add packages that represent potential vulnerabilities, and provide no operational benefit.
+
+Multi-stage builds allow the build environment and the runtime environment to be completely independent. The final image contains only what the running container needs: Nginx and the static files it serves.
+
+### Result
+
+Production image size approximately 25–30MB versus 600MB+ for an equivalent single-stage image. No Node.js runtime, no source code, and no development dependencies in production.
+
+---
+
+## Decision 21 — Use npm ci instead of npm install for the build stage
+
+### Context
+
+The build stage must install JavaScript dependencies. Both `npm install` and `npm ci` install packages, but with different guarantees about reproducibility.
+
+### Decision
+
+Use `npm ci` in the Dockerfile instead of `npm install`.
+
+### Reasoning
+
+`npm install` reads `package.json` version ranges and may install newer versions than the developer tested if they satisfy the range. It may modify `package-lock.json`. This behavior is acceptable in development. In a production build it is not — it allows the Docker build to install untested dependency versions.
+
+`npm ci` reads exclusively from `package-lock.json` and installs the exact recorded versions. It never modifies the lockfile. If `package.json` and `package-lock.json` are inconsistent, it fails immediately rather than resolving silently. Every build from the same lockfile produces identical installed packages.
+
+### Tradeoff
+
+`npm ci` deletes `node_modules` and reinstalls from scratch rather than updating in place. This makes it slightly slower on the first run but faster in CI environments due to the elimination of resolution overhead.
+
+### Result
+
+Every Docker build installs the exact dependency set that was tested during development. The lockfile is the production contract.
+
+---
+
+## Decision 22 — Use Nginx to serve the frontend instead of Node.js
+
+### Context
+
+After `npm run build` completes, the frontend is a set of static files: HTML, CSS, JavaScript bundles, and assets. Something must serve them over HTTP.
+
+### Decision
+
+Use Nginx as the runtime server for the frontend container.
+
+### Reasoning
+
+Static file serving requires no application logic, no language runtime, and no dynamic processing. Nginx is purpose-built for this task. It reads a file from disk and returns it over HTTP with minimal overhead.
+
+Running a Node.js runtime to serve static files introduces a JavaScript engine, an event loop, and associated runtime overhead — none of which perform any work in this context. Nginx uses significantly less memory, serves files faster, and handles more concurrent connections for this use case.
+
+### Result
+
+Frontend runtime container is lightweight. Container memory footprint is a fraction of an equivalent Node.js file server. Nginx handles static file serving correctly without any application code.
+
+---
+
+## Decision 23 — Run Nginx with daemon off to maintain PID 1
+
+### Context
+
+Nginx by default starts as a daemon: the initial process forks worker processes and then exits. In a Docker container, PID 1 exiting causes the container to stop immediately.
+
+### Decision
+
+Use `CMD ["nginx", "-g", "daemon off;"]` to prevent Nginx from daemonizing.
+
+### Reasoning
+
+Docker monitors PID 1. When PID 1 exits, Docker considers the container's work complete and stops it. Nginx's default daemon behavior would cause PID 1 to exit immediately after forking workers, stopping the container before it serves a single request.
+
+`daemon off;` instructs Nginx to remain in the foreground as PID 1. The same PID 1 principle that governs the backend CMD — exec form to ensure the application process is PID 1 and receives OS signals — applies identically to Nginx.
+
+### Result
+
+Nginx remains as PID 1. The container runs as long as Nginx runs. Container lifetime is correctly tied to the web server process.

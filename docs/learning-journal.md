@@ -289,3 +289,81 @@ The containers themselves are not Docker's invention. They are Linux process iso
 Phase 2B is complete. Every major topic — Dockerfile engineering, image construction, layer cache, networking fundamentals, container runtime, failure analysis, storage model — was investigated, verified experimentally, and documented.
 
 The open investigation into `FROM node:22-alpine` Alpine tradeoffs carries forward to Phase 3, where multi-container deployment with Docker Compose will also resolve the MySQL connection failure observed throughout Phase 2B.
+
+---
+
+## Phase 3 — Frontend Containerization
+
+### On the Fundamental Difference Between Frontend and Backend Containers
+
+Phase 3 started with a question that seemed simple: can a browser execute React source code directly? Thinking through that question produced the most important conceptual shift in Phase 3.
+
+The backend container runs a process. Node.js starts, opens a socket, waits for requests, and executes application logic on each one. The container is the runtime. The source code runs inside it.
+
+The frontend container serves files. The React source code was already transformed — by a build tool, during the build phase — into ordinary HTML, CSS, and JavaScript. Those files are placed in a directory. Nginx reads them from disk and returns them when requested. No JavaScript executes inside the container. No framework runs. The container is a file server. The application runs in the browser after being downloaded.
+
+This distinction changes everything about how the container is designed. The backend container needs a language runtime permanently. The frontend container needs a build tool once — to produce the output — and then never again.
+
+---
+
+### On Node.js as a Compiler
+
+The framing of Node.js as a compiler for the frontend build was the most useful conceptual reframe in Phase 3.
+
+When `npm run build` executes, Node.js is not serving a website. It is transforming source code into a different form. JSX becomes JavaScript function calls. CSS modules become scoped class names. Hundreds of import statements become a handful of optimised bundles. The transformation is complete when the build finishes. Node.js has nothing left to do.
+
+This is identical to how a TypeScript compiler works: it reads `.ts` files, produces `.js` files, and exits. Nobody installs the TypeScript compiler in a production Docker image to run a TypeScript application. The compiled output is deployed. The compiler is left behind.
+
+Seeing `npm run build` as compilation rather than execution made the multi-stage build design obvious rather than clever.
+
+---
+
+### On Multi-Stage Builds as Separation of Concerns
+
+The multi-stage build felt like a Docker trick until the dependency analysis made it clear it is an architectural requirement.
+
+The build environment and the runtime environment need completely different things. Combining them into one image produces an image that is wrong for both purposes: too heavy for production, and if the build tools were removed, unable to build.
+
+The stage boundary is a hard separation. Nothing crosses it unless explicitly named in a `COPY --from` instruction. Everything else — hundreds of megabytes of `node_modules`, the entire source tree, the build tool itself — is permanently discarded at the `FROM nginx:alpine` line.
+
+The analogy that made this concrete: a manufacturing plant that builds a product and a warehouse that stores and ships it. Nothing from the factory floor — the machinery, the raw materials, the in-progress inventory — goes into the warehouse. Only the finished product crosses the boundary. Multi-stage builds enforce the same separation in software.
+
+---
+
+### On npm ci as an Engineering Commitment
+
+`npm ci` is not faster `npm install`. It is a different contract.
+
+`npm install` says: install something compatible with these requirements.
+
+`npm ci` says: install exactly what was tested.
+
+The lockfile is the evidence that specific versions were tested. `npm ci` treats the lockfile as law. The production build installs what the developer tested, not what npm decides is acceptable on the day the Docker build runs.
+
+This matters more in containerized environments than anywhere else. A container is expected to be reproducible — to behave the same whether built today or in six months. `npm install` breaks that expectation silently. `npm ci` enforces it explicitly, failing the build if the lockfile and manifest are inconsistent rather than resolving the inconsistency automatically.
+
+---
+
+### On Nginx and the Simplicity of Static File Serving
+
+The intuition about Nginx being lightweight was correct, but Phase 3 made the reason precise.
+
+Nginx serving static files performs three operations: receive request, find file, return file. There is no JavaScript to execute, no framework to initialise, no database to query. The request-to-response path is as short as it can possibly be.
+
+Running Node.js for this task would be like using a full application server to serve a directory listing. The runtime overhead is real, the memory consumption is measurable, and none of it produces any benefit. Nginx is the right tool because it is purpose-built for exactly the operation being performed.
+
+---
+
+### On PID 1 as a Universal Container Principle
+
+Phase 1 introduced PID 1. Phase 2B confirmed it with Node.js. Phase 3 reinforced it with Nginx.
+
+Every containerized process that must run indefinitely — whether it is Node.js serving an API, Nginx serving files, or any other long-running service — must be configured to remain as PID 1 in the foreground. The mechanism varies: Node.js naturally stays in the foreground unless explicitly killed; Nginx requires `daemon off;` to prevent its default daemonizing behavior. The requirement is the same.
+
+This is not a Docker-specific concept. It is a consequence of how Linux process management works. Docker monitors PID 1. When PID 1 exits, the container stops. Every containerized service must be configured accordingly.
+
+---
+
+## Phase 3 — Status
+
+Phase 3 Dockerfile analysis is complete. The conceptual foundation — frontend execution model, build vs runtime distinction, multi-stage builds, `npm ci`, Nginx document root, `daemon off` — is fully established. The practical build, inspection, and verification work continues in the next session.
