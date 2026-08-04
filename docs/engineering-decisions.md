@@ -547,3 +547,137 @@ Docker monitors PID 1. When PID 1 exits, Docker considers the container's work c
 ### Result
 
 Nginx remains as PID 1. The container runs as long as Nginx runs. Container lifetime is correctly tied to the web server process.
+
+---
+
+## Phase 4 — Docker Compose Decisions
+
+## Decision 24 — Describe infrastructure declaratively rather than imperatively
+
+### Context
+
+Running a three-service application with Docker CLI requires five or more correctly sequenced commands. Any omission or ordering error produces a failure that may be difficult to diagnose. Two developers executing the sequence independently may produce different infrastructure states.
+
+### Decision
+
+Describe the complete application infrastructure in a `docker-compose.yml` file and use `docker compose up` as the single command to start the system.
+
+### Reasoning
+
+Declarative infrastructure is reproducible. The file is version-controlled alongside application code. Every developer who checks out the repository and runs `docker compose up` receives an identical environment. The infrastructure is no longer a procedure in a README — it is a machine-readable specification.
+
+This is the same principle applied by Kubernetes manifests, Terraform configurations, and CloudFormation templates. The mental model and the discipline established with Docker Compose apply directly to all of them.
+
+### Result
+
+One command starts the complete three-tier application. Environment consistency across developer machines is guaranteed by the file.
+
+---
+
+## Decision 25 — Use image: for MySQL, build: for first-party services
+
+### Context
+
+The application requires three containers: MySQL, the Node.js backend, and the React frontend. MySQL is a third-party database with an officially maintained image. The backend and frontend are developed in this repository.
+
+### Decision
+
+Use `image: mysql:8` for MySQL. Use `build: ./api` and `build: ./client` for the backend and frontend respectively.
+
+### Reasoning
+
+MySQL's source code is not in this repository and should not be. The MySQL team maintains a production-grade image that is regularly updated, security-patched, and documented. Using `image:` consumes that work directly.
+
+The backend and frontend contain application-specific code that must be compiled into images from source. `build:` triggers `docker build` against the respective Dockerfile, producing an image tailored to the application's requirements.
+
+### Result
+
+Third-party services are consumed as published images. First-party services are built from source. Each category uses the correct mechanism.
+
+---
+
+## Decision 26 — Separate service names from container names
+
+### Context
+
+Compose assigns both a service name (for DNS and `depends_on`) and a container name (for CLI operations). The project sets explicit `container_name:` values.
+
+### Decision
+
+Keep service names and container names consistent in this project for clarity, but understand and document them as separate concerns.
+
+### Reasoning
+
+Service names are the DNS identity — they are what other services use in `DB_HOST`, `depends_on`, and inter-container communication. Container names are the CLI handle — they are what `docker logs`, `docker exec`, and `docker stop` use.
+
+Setting `container_name:` makes CLI operations predictable without relying on generated names. However, explicit `container_name:` prevents horizontal scaling of that service because two containers cannot share a name. This tradeoff is acceptable for a development environment. Production deployments that require scaling would remove `container_name:` and let Compose generate unique names per replica.
+
+### Result
+
+CLI operations use predictable names. The distinction between service identity and container identity is documented for future scaling considerations.
+
+---
+
+## Decision 27 — Use a named volume for MySQL data persistence
+
+### Context
+
+MySQL stores database files at `/var/lib/mysql`. Without a volume, this data is lost when the container is removed.
+
+### Decision
+
+Mount a named volume (`mysql-data`) at `/var/lib/mysql`.
+
+### Reasoning
+
+Containers are ephemeral. The writable layer of a container is deleted when the container is removed. Mounting a named volume at the database storage path moves the data outside the container lifecycle. The volume persists through `docker compose down` and is available when a new MySQL container starts.
+
+A named volume is preferred over a bind mount for database storage because Docker manages its lifecycle independently of the host filesystem layout. It is portable across machines and does not depend on a specific host directory path.
+
+### Result
+
+Database contents survive container removal and restart. `docker compose down` and `docker compose up` do not lose data. `docker compose down -v` is required to explicitly remove the volume and reset the database.
+
+---
+
+## Decision 28 — Use depends_on for startup ordering, not readiness
+
+### Context
+
+The backend must connect to MySQL. If the backend starts before MySQL is accepting connections, `ECONNREFUSED` occurs.
+
+### Decision
+
+Use `depends_on` to establish startup ordering. Do not rely on it for readiness guarantees.
+
+### Reasoning
+
+`depends_on` guarantees that the MySQL container is started before the backend container. It does not guarantee that MySQL has finished initializing and is accepting connections. This distinction is documented explicitly.
+
+The correct solution for readiness is either health checks (Docker-side) or connection retry logic (application-side). Retry logic is more portable and is the standard production approach.
+
+### Result
+
+Startup ordering is deterministic. Readiness is handled at the application level. The distinction between "container started" and "application ready" is preserved as an engineering principle.
+
+---
+
+## Decision 29 — Separate configuration from code via environment variables
+
+### Context
+
+The backend requires database credentials, a JWT secret, and other configuration values. These values differ between environments.
+
+### Decision
+
+Supply all environment-specific configuration via `environment:` in the Compose file. The application reads values from `process.env`. No configuration values are hardcoded in application source code.
+
+### Reasoning
+
+This is the 12-Factor App configuration principle: strict separation between code and configuration. The same Docker image can be deployed to any environment by changing the environment variables supplied to it. The image itself does not need to be rebuilt for different environments.
+
+In this project, credentials are in the Compose file for development convenience. Production environments would source these values from `.env` files, Docker secrets, or a secrets manager — keeping the application code unchanged.
+
+### Result
+
+Application code is environment-agnostic. Configuration is supplied at deployment time. The same image runs in development, staging, and production with different configurations.

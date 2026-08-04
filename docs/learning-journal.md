@@ -432,3 +432,75 @@ This is a deployment concern that the build tool handles automatically. The impl
 Phase 3 is complete. The frontend image is built, the container is verified, and the complete delivery chain from React source to browser has been traced end-to-end.
 
 Phase 4 begins the transition from individual containers to multi-container orchestration. Docker Compose will connect the frontend, backend, and MySQL into a single coordinated application — resolving the MySQL connection failure that has been present since Phase 2B.
+
+---
+
+## Phase 4 — Docker Compose
+
+### On the Shift from Containers to Systems
+
+Phases 1 through 3 developed a precise mental model for a single container: how it is built, how it runs, how its network namespace is isolated, how PID 1 governs its lifetime. Phase 4 required a different kind of thinking — not about any one container, but about how a set of containers constitutes an application.
+
+The shift is from "how does this container work" to "how does this system behave." The individual container knowledge is still required. But the unit of reasoning becomes the service graph, not the individual image.
+
+---
+
+### On Declarative Infrastructure as a Mental Model
+
+The five pre-Compose questions established something important before a single line of YAML was read: the problem Docker Compose solves is not primarily technical. It is an engineering consistency problem. Different developers creating infrastructure with different commands on different days produces different environments. The same code runs differently because the infrastructure differs.
+
+Describing infrastructure declaratively — as a specification of what should exist rather than a sequence of steps to create it — is the pattern that eliminates this class of problem. The file is the contract. Everyone who executes it gets the same result.
+
+Recognizing this as a pattern — not a Docker Compose feature — meant immediately understanding why Kubernetes manifests, Terraform, and CloudFormation exist. They solve the same problem at different scales. The mental model transfers.
+
+---
+
+### On Service Names vs Container Names
+
+The distinction between service names and container names was the first genuinely new concept in Phase 4.
+
+A service name is the application's internal address for a component. `DB_HOST=mysql` works because Docker DNS resolves `mysql` — the service name — to the MySQL container's current IP. It does not resolve the container name. It does not resolve the image name.
+
+A container name is a CLI handle. `docker logs mysql` works because `container_name: mysql` was set. If the container name were `database123` but the service name remained `mysql`, `DB_HOST=mysql` would still work — because DNS resolves service names — and `docker logs database123` would be the command to use.
+
+The practical consequence: in a horizontally scaled service where three backend containers run simultaneously, Docker Compose generates unique container names for each (`backend-api-1`, `backend-api-2`, `backend-api-3`). The frontend still connects to `backend:5000` — the service name, which DNS resolves to any available backend container. Service names are stable. Container names are not.
+
+This is the same model Kubernetes uses: a Service provides a stable DNS name for a group of Pods. The Pods are replaceable. The Service is stable.
+
+---
+
+### On depends_on and the Container Started / Application Ready Distinction
+
+`depends_on` was the most conceptually refined topic in Phase 4.
+
+The initial intuition — that `depends_on: mysql` means "wait for MySQL to be ready" — is wrong in a specific and important way. It means "wait for the MySQL container to be started." The container starting and MySQL being ready are two different events separated by seconds of initialization.
+
+Understanding why Compose chose not to solve the readiness problem by default was the more interesting question. Docker manages containers. It does not manage applications. Every application has a different definition of "ready." MySQL is ready when port 3306 accepts connections. A machine learning inference service is ready after loading a model that may take minutes to deserialize. Docker cannot know these things without the application or image author defining them explicitly.
+
+The correct model: Docker is responsible for lifecycle — creating, starting, stopping containers. Applications are responsible for resilience — retrying connections, handling initialization delays, reporting health. These responsibilities do not overlap. Each belongs where it belongs.
+
+---
+
+### On Environment Variables as the Boundary Between Code and Configuration
+
+Environment variables in Docker Compose are not a Docker feature. They are a Linux feature. Docker injects them into the process environment before the application starts. The application reads them via `process.env` in Node.js, `os.environ` in Python, `System.getenv()` in Java — the same mechanism used when running directly on a server without Docker.
+
+What Docker Compose contributes is making it convenient to specify these values per service, per environment, in a single file. The injected values change the application's behavior without changing its code.
+
+The different naming conventions between services — `MYSQL_ROOT_PASSWORD` vs `DB_PASSWORD` — made the underlying model clear. Docker does not define variable names. Each application defines its own configuration contract. Docker delivers whatever values are specified without interpreting or transforming them. The DevOps engineer's role is to translate between the contracts: ensure that the value MySQL expects under `MYSQL_ROOT_PASSWORD` is the same value the backend expects under `DB_PASSWORD`.
+
+---
+
+### On Volumes as the Boundary Between Ephemeral and Persistent
+
+Every container phase before Phase 4 worked with stateless containers — the backend API and the Nginx file server. Removing and recreating them loses no meaningful state. That property is desirable and intentional.
+
+MySQL is different. The database stores the application's persistent state. If `docker compose down` deleted the database, every restart would begin with an empty system. Volumes are the mechanism that separates "data that should outlive the container" from "data that is part of the container itself."
+
+The named volume `mysql-data` exists independently of the MySQL container. It was created by Compose, it stores MySQL's data files, and it will exist after the container is removed. The next MySQL container that mounts it will find the data where it was left. Container and data have independent lifecycles. That independence is the engineering value of volumes.
+
+---
+
+## Phase 4 — Status
+
+Phase 4 conceptual analysis is complete. The `docker-compose.yml` has been fully analyzed: services, image vs build, container names, restart policies, environment variables, volumes, ports, depends_on, and implicit networking. The practical phase — `docker compose up`, system verification, debugging, and retrospective — continues in the next session.
