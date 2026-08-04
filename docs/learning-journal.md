@@ -367,3 +367,68 @@ This is not a Docker-specific concept. It is a consequence of how Linux process 
 ## Phase 3 — Status
 
 Phase 3 Dockerfile analysis is complete. The conceptual foundation — frontend execution model, build vs runtime distinction, multi-stage builds, `npm ci`, Nginx document root, `daemon off` — is fully established. The practical build, inspection, and verification work continues in the next session.
+
+---
+
+## Phase 3 — Practical Validation Observations
+
+### On the Build Context Size
+
+The frontend build context was 337.3MB — sixty times larger than the backend's 5.224MB. The cause was the local `node_modules/` directory being included in the build context before transmission to Docker Engine. This is a direct, measurable consequence of a missing or incomplete `.dockerignore`.
+
+The irony is precise: `npm ci` inside the container performs a clean install and never touches the transmitted `node_modules/`. The 337MB was transmitted, never used, and then discarded. Adding `node_modules/` to `.dockerignore` would reduce the build context to a few megabytes and save significant transmission time on every build.
+
+This observation demonstrates that `.dockerignore` is not only a security control — it is also a build performance control.
+
+---
+
+### On 1350 Packages Leaving Zero Trace in the Final Image
+
+The single most visually striking observation from Phase 3 was the image size after the build:
+
+```
+frontend:v1   94.4MB
+nginx:alpine  92.8MB
+```
+
+1350 packages were downloaded and installed. `npm run build` executed a full compilation and bundling pipeline. Stage 1 accumulated hundreds of megabytes of build tooling. The final image is 1.6MB larger than bare Nginx.
+
+None of Stage 1's accumulation crossed the stage boundary. The `COPY --from=builder` instruction transferred approximately 90kB of JavaScript and CSS. Everything else — the Node runtime, 1350 packages, React source, build configuration — was permanently discarded at the `FROM nginx:alpine` instruction.
+
+The stage boundary is a hard reset. It does not inherit, accumulate, or leak. Multi-stage builds are not a size optimisation applied after the fact — they are the architectural reason the final image is small.
+
+---
+
+### On pwd Returning / as Proof of Stage Isolation
+
+When `docker exec` opened a shell inside the frontend container and `pwd` returned `/` — not `/app` — it was the most concrete possible proof of stage isolation.
+
+`WORKDIR /app` was set in Stage 1. Stage 2 started from `nginx:alpine` with no inherited configuration. The working directory of the running container is whatever the base image of Stage 2 defines, plus whatever Stage 2 itself configures. Stage 1's `WORKDIR` instruction has no existence in Stage 2.
+
+This single observation — a directory path — confirms the entire multi-stage isolation model more directly than any diagram.
+
+---
+
+### On Nginx's Master-Worker Architecture
+
+`ps` inside the frontend container showed three processes: PID 1 (master), and two workers. The backend showed PID 1 (node) with no workers.
+
+Node.js uses an event loop — a single-threaded, asynchronous model where one process handles many concurrent connections. Nginx uses a master-worker model — the master manages configuration and worker lifecycle, and workers handle connections in parallel across CPU cores.
+
+Both are valid concurrency models for different purposes. The observation that mattered was the same in both cases: PID 1 is the process Docker monitors. Whether PID 1 is a Node.js event loop or an Nginx master process, the container runs as long as PID 1 runs.
+
+---
+
+### On Content Hashes in Filenames
+
+`main.fe8d536d.js` — the eight-character hash embedded in the filename is generated from the file's content. If the JavaScript changes, the hash changes, and the filename changes. Browsers that cached the old file will request a new URL automatically on the next page load.
+
+This is a deployment concern that the build tool handles automatically. The implication for containerization: every production build produces a uniquely named set of assets. Deploying a new container version does not require any cache invalidation mechanism — the new filenames do the work.
+
+---
+
+## Phase 3 — Status
+
+Phase 3 is complete. The frontend image is built, the container is verified, and the complete delivery chain from React source to browser has been traced end-to-end.
+
+Phase 4 begins the transition from individual containers to multi-container orchestration. Docker Compose will connect the frontend, backend, and MySQL into a single coordinated application — resolving the MySQL connection failure that has been present since Phase 2B.
