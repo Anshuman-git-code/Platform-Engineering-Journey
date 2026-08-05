@@ -623,3 +623,59 @@ The Pod is that group. In most deployments, a Pod contains one container. But th
 ## Phase 5 — Status
 
 Phase 5 cluster architecture is complete. The Control Plane components (API Server, etcd, Scheduler, Controller Manager), Worker Node components (kubelet, container runtime), the Desired State model, and the Pod abstraction have all been established from engineering first principles. The remaining Phase 5 topics — ReplicaSets, Deployments, Services, and cluster networking — continue in the next session.
+
+---
+
+## Phase 5 — Pods, ReplicaSets, Deployments, Services
+
+### On Discovering Why Pods Exist Before Being Told
+
+The Pod concept was introduced through the log-shipping scenario — two containers that must always run together, share localhost, and share a lifecycle. Working through that scenario before the definition arrived meant the definition was a confirmation of reasoning rather than a new fact to memorize.
+
+The most important realization: Google did not invent Pods because containers were insufficient. They invented Pods because the unit of scheduling, networking, and lifecycle management needed to be a group, not an individual container. Everything else in Kubernetes — Deployments, Services, the Scheduler — operates on Pods. Making the Pod the atomic unit keeps every other system simple.
+
+---
+
+### On the Pause Container as Hidden Infrastructure
+
+The Pause container was the biggest conceptual surprise in Phase 5. Every Pod runs a container that is invisible in normal operations, consumes negligible resources, and exists solely to hold a network namespace open. This is elegant engineering: instead of coupling two application containers' lifecycles to each other's network namespace, both containers join a third container's namespace — one that never crashes because its only instruction is to sleep.
+
+The consequence: when the backend container crashes and restarts, the Pod's IP address does not change. The network namespace lives in the Pause container, not in the backend container. Other services continue routing to the same IP while the backend recovers.
+
+This also explains how "shared localhost" works at the kernel level. Two containers sharing a network namespace is not a Kubernetes abstraction — it is a Linux kernel feature that Kubernetes exposes through the Pod spec.
+
+---
+
+### On the Reconciliation Loop as the Central Pattern
+
+The reconciliation loop appears in every Kubernetes controller: observe actual state, compare to desired state, compute delta, act to close the gap. This is not just a Kubernetes design — it is a fundamental pattern in resilient distributed systems.
+
+Event-driven systems are fragile: if the event that triggers a repair is lost, the repair never happens. Reconciliation-driven systems are resilient: the repair loop runs continuously regardless of whether any event was received. The cluster repairs itself not because something told it to, but because it continuously checks whether it should.
+
+Recognizing this pattern makes every controller's behavior predictable. A ReplicaSet Controller reconciles Pod count. A Deployment Controller reconciles ReplicaSet configurations. A Node Controller reconciles node availability. The pattern is the same. Only the objects being reconciled differ.
+
+---
+
+### On Why Deployments Create New ReplicaSets
+
+The decision to create a new ReplicaSet for each deployment version rather than modifying the existing one was the most important Deployment insight. It preserves version history as data — not as documentation, not as a git tag, but as live Kubernetes objects that can be immediately activated by scaling them up.
+
+A rollback is not a redeployment. It is a scaling reversal. The old ReplicaSet already exists. Its Pod spec is already correct. Its image is already in the registry. Scaling it from 0 to 3 and the new ReplicaSet from 3 to 0 is a matter of seconds.
+
+This design decision explains something that previously seemed like magic: rollbacks in Kubernetes are fast not because Kubernetes is fast, but because the previous version was never actually deleted.
+
+---
+
+### On Services and the Same DNS Pattern at Cluster Scale
+
+Docker Compose service names resolve to container IPs via Docker's internal DNS. Kubernetes Service names resolve to stable ClusterIPs via kube-dns. The mechanism differs in implementation — kube-dns instead of Docker DNS, iptables rules instead of bridge forwarding — but the engineering model is identical.
+
+The scale difference matters: in Docker Compose, one container per service. In Kubernetes, a Service fronts one or many Pod replicas and load balances across them. But the application code is the same: `DB_HOST=mysql` works in both environments because the DNS resolution model is consistent. Moving from Docker Compose to Kubernetes does not require changing the database hostname in the application — only deploying a Service named `mysql`.
+
+---
+
+## Phase 5 — Status: Complete
+
+All Kubernetes foundational concepts are established. The complete execution path from `kubectl apply` through API Server, etcd, Controller Manager, Scheduler, kubelet, containerd, to a running Pod serving traffic through a Service is fully understood from first principles.
+
+Phase 6 applies this understanding to the project's actual Kubernetes manifests in `K8s/`.

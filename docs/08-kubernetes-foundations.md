@@ -688,6 +688,479 @@ In practice, most Pods in this project contain exactly one container. The Pod ab
 
 ---
 
+## Pod Internals — The Pause Container
+
+Understanding why Pods provide shared networking requires going one level deeper into how the Linux kernel implements the isolation that Pods expose.
+
+### Linux Namespaces — The Foundation
+
+A container is a Linux process running inside a restricted namespace. The kernel provides:
+
+- **Network namespace** — a private virtual networking stack: its own routing table, firewall rules, IP loopback interface, and port table
+- **PID namespace** — the process sees only its own process tree; its main process appears as PID 1
+- **Mount namespace** — the process sees only a specific portion of the filesystem
+
+A standard Docker container receives its own isolated instance of each of these namespaces. It has its own IP address, its own localhost, its own filesystem view — entirely separate from every other container on the same machine.
+
+### The Multi-Container Problem
+
+Two containers in separate network namespaces cannot communicate via localhost. They would need to make network calls between their respective IP addresses — adding latency, complexity, and configuration.
+
+If one container's namespace is destroyed (because that container crashes), the other container loses its network connection, even if the connection was to a third container that is still running.
+
+### The Pause Container Solution
+
+When Kubernetes creates a Pod, the container runtime first launches a minimal process called the **Pause container** (also called the infra container):
+
+```
+Pod creation sequence:
+
+1. containerd starts Pause container
+   → Pause container calls pause() in C — an infinite sleep
+   → Linux assigns a network namespace to Pause container
+   → Pod IP address is bound to this network namespace
+   → Network namespace is now stable and permanent
+
+2. Backend container starts
+   → Instead of a new network namespace, it joins Pause container's namespace
+   → Sees the same IP, same localhost, same port table
+
+3. Log Collector container starts
+   → Also joins Pause container's network namespace
+   → Same IP, same localhost
+```
+
+The Pause container holds the network namespace open. If the backend container crashes and restarts, its namespace disappears — but it was joined to the Pause container's namespace, not the other way around. The Pause container never stops. The network namespace stays alive. The Pod IP address never changes.
+
+```
+Pod
+├── Pause container (holds network namespace, IP: 10.244.1.17)
+│     └── Network namespace (shared by all containers in Pod)
+│
+├── Backend container (joins Pause network namespace)
+│     └── localhost:5000 — reachable by any container in this Pod
+│
+└── Log Collector container (joins Pause network namespace)
+      └── localhost reads logs from backend via shared namespace
+```
+
+This is the mechanism behind "containers in a Pod share localhost" — they literally share the same network namespace, which is owned and held open by the invisible Pause container.
+
+### Shared Volumes
+
+Storage sharing follows the same model at the filesystem layer. A volume declared in the Pod spec is mounted into the MNT namespace of each container that requests it. The Backend writes to `/var/log/app.log`. The Log Collector reads from the same path. Both see the same bytes because both are mounted into the same directory on the Worker Node's disk.
+
+---
+
+## Controller Manager
+
+### Engineering Problem
+
+ReplicaSets maintain a desired number of Pods. Deployments manage rolling updates. Services track healthy Pod endpoints. Who runs these reconciliation loops? Who compares desired state to actual state, continuously, for every object in the cluster?
+
+This is the Controller Manager's role.
+
+### What the Controller Manager Is
+
+The Controller Manager is a single process that hosts many independent controllers. Each controller watches one type of Kubernetes object and runs a continuous reconciliation loop for it.
+
+```
+Controller Manager process
+├── ReplicaSet Controller   — ensures N Pods are running
+├── Deployment Controller   — manages ReplicaSets for rolling updates
+├── Node Controller         — detects node failures, evicts Pods
+├── Job Controller          — ensures batch jobs complete
+├── Namespace Controller    — creates default resources in new namespaces
+├── ServiceAccount Controller
+└── ... (many more)
+```
+
+The Controller Manager does not make scheduling decisions (that is the Scheduler's job). It does not start containers (that is the kubelet's job). It watches the desired state in etcd via the API Server and compares it to the actual state of the cluster, then requests changes through the API Server when a difference is found.
+
+### The Reconciliation Loop Pattern
+
+Every controller in the Controller Manager follows the same loop:
+
+```
+LOOP (running continuously):
+    │
+    ▼
+Observe actual state (via API Server)
+    │
+    ▼
+Read desired state (from etcd via API Server)
+    │
+    ▼
+Compute difference (delta = desired - actual)
+    │
+    ▼
+If delta ≠ 0: take corrective action (via API Server)
+    │
+    ▼
+Return to top of loop
+```
+
+**The delta calculation:**
+
+| Desired | Actual | Delta | Action |
+|---|---|---|---|
+| 3 | 3 | 0 | None |
+| 3 | 2 | +1 | Create 1 Pod |
+| 3 | 5 | -2 | Delete 2 Pods |
+
+The reconciliation loop does not care how the cluster reached its current state. A Pod may have been manually deleted, crashed due to an OOM error, or disappeared because a node lost power. The loop sees only the current delta and corrects it. This is why Kubernetes is self-healing — the correction mechanism is continuous, not event-driven.
+
+**Event-driven vs reconciliation-driven:**
+
+```
+Event-driven (fragile):
+Pod crashes → trigger event → create new Pod
+Problem: if the event is lost, the Pod is never recreated.
+
+Reconciliation-driven (resilient):
+LOOP → Pod count is 2 but desired is 3 → create Pod
+The fix happens regardless of whether an event was received.
+```
+
+### Why the Controller Manager Exists as a Separate Process
+
+The Scheduler could have included replica management. The API Server could have included version management. They were separated for the same reason every Kubernetes component is separated — single responsibility, pluggability, and fault isolation. If the Controller Manager crashes, the API Server and Scheduler continue functioning. Existing Pods keep running. The cluster does not collapse — it simply stops self-healing until the Controller Manager is restarted.
+
+---
+
+## ReplicaSets
+
+### Engineering Problem
+
+A standalone Pod has no guarantee of staying alive. If it crashes, it is gone. If the node it runs on fails, it is gone. There is no record of how many copies should exist.
+
+Applications need a declarative guarantee: "always run exactly N copies of this Pod."
+
+### What a ReplicaSet Is
+
+A ReplicaSet is a Kubernetes object that declares a desired number of identical Pod replicas and delegates to the ReplicaSet Controller to continuously maintain that count.
+
+```
+apiVersion: apps/v1
+kind: ReplicaSet
+spec:
+  replicas: 3        ← desired count
+  selector:          ← which Pods this ReplicaSet owns
+  template:          ← Pod spec to create when count is low
+```
+
+The ReplicaSet itself is data stored in etcd. The ReplicaSet Controller reads it, counts running Pods matching the selector, and creates or deletes Pods as needed.
+
+### The Factory Manager Analogy
+
+A factory manager has one rule: keep exactly 10 workers on the floor at all times. The manager does not know how to manufacture anything. The manager only counts, hires, and fires. When a worker leaves sick, the manager immediately hires a replacement. When the floor is overstaffed, the manager reduces headcount.
+
+The ReplicaSet Controller is that manager. It does not understand the application. It counts, creates, and deletes Pods.
+
+### What Happens When a Pod Is Manually Deleted
+
+```
+kubectl delete pod backend-2
+        │
+        ▼
+API Server removes Pod object from etcd
+        │
+        ▼
+ReplicaSet Controller's reconciliation loop:
+  Desired: 3
+  Actual:  2
+  Delta:   +1
+        │
+        ▼
+ReplicaSet Controller requests new Pod creation via API Server
+        │
+        ▼
+API Server stores new Pod in etcd
+        │
+        ▼
+Scheduler assigns Pod to a Worker Node
+        │
+        ▼
+kubelet starts the container
+        │
+        ▼
+Pod count returns to 3
+```
+
+The ReplicaSet does not distinguish between "the administrator deleted this" and "the node crashed." Both produce the same delta. Both produce the same response: create a Pod.
+
+### What ReplicaSet Does Not Do
+
+A ReplicaSet does not manage application versions. If the image changes from `backend:v1` to `backend:v2`, the ReplicaSet cannot orchestrate a rolling replacement. It only knows how to maintain count — not how to safely transition between versions. That limitation is precisely why Deployments exist.
+
+---
+
+## Deployments
+
+### Engineering Problem
+
+ReplicaSets keep N Pods alive. But production applications need to release new versions without downtime, and they need to be able to reverse those releases quickly when bugs are discovered. ReplicaSets have no mechanism for this.
+
+### What a Deployment Is
+
+A Deployment is a higher-level Kubernetes object that manages ReplicaSets and provides:
+
+- **Rolling updates** — transition from one version to another without downtime
+- **Rollbacks** — return to a previous version instantly
+- **Update history** — audit trail of what was deployed when
+
+The Deployment manages ReplicaSets. ReplicaSets manage Pods. Pods contain containers.
+
+```
+Deployment
+    │  manages
+    ▼
+ReplicaSet (v1 — scaling down)   ReplicaSet (v2 — scaling up)
+    │                                 │
+    ▼                                 ▼
+Pod v1   Pod v1                Pod v2   Pod v2   Pod v2
+```
+
+### Why a New ReplicaSet Is Created — Not Modified
+
+When a Deployment receives an updated image tag, it does not modify the existing ReplicaSet. It creates a new ReplicaSet for the new version and manages two ReplicaSets simultaneously during the transition.
+
+```
+Before update:
+ReplicaSet v1: 3 Pods (backend:v1)
+
+Update to backend:v2:
+ReplicaSet v1: 3 → 2 → 1 → 0 Pods
+ReplicaSet v2: 0 → 1 → 2 → 3 Pods
+
+After update:
+ReplicaSet v1: 0 Pods (scaled down, but preserved)
+ReplicaSet v2: 3 Pods (backend:v2)
+```
+
+ReplicaSet v1 is not deleted. It is scaled to zero and retained in etcd. This is the mechanism that makes rollback instant — the previous ReplicaSet configuration already exists:
+
+```
+Rollback to v1:
+ReplicaSet v2: 3 → 2 → 1 → 0 Pods
+ReplicaSet v1: 0 → 1 → 2 → 3 Pods
+
+Total time: seconds
+No image rebuild. No YAML recalculation.
+```
+
+### The Rolling Update Sequence
+
+```
+Desired: backend:v2, replicas: 3
+Current: backend:v1, 3 Pods running
+
+Step 1: Start 1 new v2 Pod
+  v1: [Pod] [Pod] [Pod]
+  v2: [Pod]
+
+Step 2: v2 Pod passes health check → remove 1 v1 Pod
+  v1: [Pod] [Pod]
+  v2: [Pod] [Pod]
+
+Step 3: Start 1 more v2 Pod
+  v1: [Pod] [Pod]
+  v2: [Pod] [Pod] [Pod]
+
+Step 4: v2 Pod healthy → remove 1 v1 Pod
+  v1: [Pod]
+  v2: [Pod] [Pod] [Pod]
+
+Step 5: Start final v2 Pod... (already at 3) → remove last v1 Pod
+  v1: []
+  v2: [Pod] [Pod] [Pod]
+
+Result: zero downtime, full version transition
+```
+
+### The Complete Object Hierarchy
+
+```
+Deployment
+    │
+    ▼
+ReplicaSet (version management)
+    │
+    ▼
+Pods (execution units)
+    │
+    ▼
+Containers (application processes)
+```
+
+In practice, engineers write Deployment YAML. Kubernetes automatically creates and manages ReplicaSets. Engineers rarely interact with ReplicaSets directly.
+
+---
+
+## Services
+
+### Engineering Problem
+
+Pods are ephemeral. When a Pod crashes and is recreated by a ReplicaSet, the new Pod receives a new IP address. If the frontend is configured to communicate with `10.244.1.17` (the backend Pod's IP), and that Pod is replaced with a new Pod at `10.244.2.31`, the frontend loses the connection.
+
+Additionally, three backend Pods running simultaneously cannot all be reached at the same IP. Traffic must be distributed across them.
+
+```
+Problem:
+Frontend → backend Pod IP: 10.244.1.17
+Pod crashes. New Pod: 10.244.2.31
+Frontend still sending to 10.244.1.17 → connection refused
+```
+
+### What a Service Is
+
+A Service is a stable network identity for a set of Pods. It provides:
+
+- **A stable IP address** that does not change when Pods are replaced
+- **A DNS name** resolvable by other services in the cluster
+- **Load balancing** across all healthy Pod replicas
+
+```
+Frontend
+    │
+    │  GET http://backend-service:5000
+    ▼
+Service: backend-service
+    │  stable IP: 10.96.45.12 (ClusterIP — never changes)
+    │  DNS: backend-service.default.svc.cluster.local
+    │
+    ├── Pod 1: 10.244.1.17  (healthy → receives traffic)
+    ├── Pod 2: 10.244.2.31  (healthy → receives traffic)
+    └── Pod 3: 10.244.3.8   (healthy → receives traffic)
+```
+
+When Pod 1 crashes and is replaced with Pod 4 at `10.244.1.42`, the Service updates its endpoint list automatically. The frontend continues sending to `backend-service:5000` without any configuration change.
+
+### How Services Find Pods — Label Selectors
+
+Services do not track Pods by name or IP. They use **label selectors**: a set of key-value pairs that a Pod must have to be included in the Service's endpoint list.
+
+```
+Service selector:
+  app: backend
+
+Pods with label app: backend → included in Service endpoints
+Pods without label app: backend → not included
+```
+
+When a new Pod is created by a Deployment with `app: backend` in its labels, it is automatically added to the Service's endpoint list. When a Pod is deleted, it is automatically removed. No manual endpoint management is required.
+
+### Service Types
+
+| Type | Accessibility | Use Case |
+|---|---|---|
+| `ClusterIP` | Within cluster only | Service-to-service communication |
+| `NodePort` | From outside cluster via Node IP + port | Development, direct external access |
+| `LoadBalancer` | From outside via cloud load balancer | Production external access on cloud |
+
+**ClusterIP** (default) — assigns a stable virtual IP address reachable only within the cluster. Used for backend-to-database and frontend-to-backend communication where external access is not required.
+
+**NodePort** — opens a specific port on every Worker Node. External traffic can reach the Service via `<any-node-ip>:<nodePort>`. Used in development environments or bare-metal deployments without cloud load balancers.
+
+**LoadBalancer** — provisions a cloud provider load balancer (AWS ELB, GCP LB) automatically and routes external traffic to the Service. Used in production on cloud platforms.
+
+### The Connection to Docker Compose DNS
+
+The Service DNS model is the production-scale equivalent of Docker Compose's service name DNS:
+
+```
+Docker Compose:                    Kubernetes:
+Service name: mysql              Service name: mysql-service
+DB_HOST=mysql                    DB_HOST=mysql-service
+Docker DNS resolves mysql        kube-dns resolves mysql-service
+→ MySQL container IP             → MySQL Pod IPs (load balanced)
+```
+
+In Docker Compose, one container per service. In Kubernetes, a Service fronts one or many Pod replicas. The naming and DNS resolution model is the same pattern at different scales.
+
+### kube-proxy
+
+kube-proxy is a component running on every Worker Node that maintains the networking rules that implement Services. When a new Service is created, kube-proxy reads the Service definition from the API Server and programs iptables (or IPVS) rules on the node to forward traffic destined for the Service's ClusterIP to the actual Pod IPs.
+
+```
+Traffic to 10.96.45.12:5000 (Service ClusterIP)
+    │
+    ▼
+kube-proxy iptables rules on Worker Node
+    │
+    ▼
+Distributed to one of:
+  10.244.1.17:5000 (Pod 1)
+  10.244.2.31:5000 (Pod 2)
+  10.244.3.8:5000  (Pod 3)
+```
+
+---
+
+## Complete Kubernetes Control Flow
+
+With all components established, the complete flow from `kubectl apply` to a browser receiving a response:
+
+```
+Developer: kubectl apply -f deployment.yaml
+        │
+        ▼
+API Server
+  ├── Authenticates request
+  ├── Validates YAML
+  ├── Writes Deployment to etcd
+  └── Returns 201 Created (milliseconds)
+        │
+Background (asynchronous):
+        ▼
+Deployment Controller (in Controller Manager)
+  ├── Sees new Deployment in etcd
+  ├── Creates ReplicaSet in etcd
+  └── ReplicaSet desired count: 3
+        │
+        ▼
+ReplicaSet Controller (in Controller Manager)
+  ├── Sees ReplicaSet with 0 running Pods
+  ├── Creates 3 Pod objects in etcd
+  └── Pods are unscheduled
+        │
+        ▼
+Scheduler
+  ├── Sees 3 unscheduled Pods in etcd
+  ├── Evaluates Worker Node resources
+  ├── Assigns each Pod to a Node
+  └── Updates Pod nodeName in etcd
+        │
+        ▼
+kubelet (on each assigned Worker Node)
+  ├── Sees Pod assigned to this node
+  ├── Instructs containerd to pull image
+  ├── containerd creates container
+  ├── Container process starts (PID 1 in container)
+  └── kubelet reports Running to API Server
+        │
+        ▼
+etcd: actual state now matches desired state
+        │
+User request:
+        ▼
+Browser → Service (ClusterIP or LoadBalancer)
+        │
+        ▼
+kube-proxy routes to one of 3 Pod IPs
+        │
+        ▼
+Pod receives request
+        │
+        ▼
+Container process handles request
+        │
+        ▼
+Response returned to browser
+```
+
+---
+
 ## Current Status
 
 ### Completed
@@ -700,25 +1173,35 @@ In practice, most Pods in this project contain exactly one container. The Pod ab
 | What is a Kubernetes Cluster | Complete |
 | Control Plane vs Worker Node — roles and separation | Complete |
 | Why a centralized Control Plane is necessary | Complete |
-| API Server — purpose, responsibilities, and why it is a separate component | Complete |
-| etcd — cluster memory, stateless API Server / stateful etcd split | Complete |
-| What happens if etcd is lost | Complete |
-| Scheduler — placement decisions, why it is separate from API Server | Complete |
-| Desired State model — the most important Kubernetes concept | Complete |
+| API Server — purpose, responsibilities | Complete |
+| etcd — cluster memory, stateless / stateful split | Complete |
+| Scheduler — placement decisions | Complete |
+| Desired State model | Complete |
 | kubelet — the Worker Node agent | Complete |
-| The four responsibilities of kubelet | Complete |
-| Complete kubectl → API Server → etcd → Scheduler → kubelet → containerd flow | Complete |
-| Network partition behavior — containers keep running | Complete |
+| Complete end-to-end execution flow | Complete |
 | Component analogy map — Docker to Kubernetes | Complete |
-| Pods — why they exist, what they are | Complete |
+| Pods — why they exist, shared network namespace | Complete |
+| Pause container — how Pod networking actually works | Complete |
+| Controller Manager — the reconciliation engine | Complete |
+| Reconciliation loop pattern — delta model | Complete |
+| ReplicaSets — desired Pod count enforcement | Complete |
+| Deployments — rolling updates, rollbacks, version management | Complete |
+| Why Deployments create new ReplicaSets rather than modifying existing ones | Complete |
+| Services — stable network identity, label selectors | Complete |
+| Service types — ClusterIP, NodePort, LoadBalancer | Complete |
+| kube-proxy — iptables rules implementing Services | Complete |
+| Complete kubectl → browser response flow | Complete |
 
-### Remaining — Phase 5 Continuation
+### Remaining — Phase 5 to Phase 6
 
 | Topic | Status |
 |---|---|
-| ReplicaSets — maintaining desired Pod count | Pending |
-| Deployments — declarative rolling updates | Pending |
-| Services — stable network identity for Pods | Pending |
-| Cluster networking — Pod-to-Pod communication | Pending |
-| Kubernetes YAML structure | Pending |
-| Phase 5 complete — begin Phase 6 (Backend on Kubernetes) | Pending |
+| Kubernetes YAML structure and field reference | Pending |
+| Phase 6 — Backend Kubernetes manifests (`K8s/backend.yaml`) | Pending |
+| Phase 7 — Frontend Kubernetes manifests (`K8s/frontend.yaml`) | Pending |
+| MySQL on Kubernetes — PersistentVolumes and StorageClasses | Pending |
+| `K8s/sc.yaml` — StorageClass analysis | Pending |
+
+### Phase 5 Status: Complete
+
+All Kubernetes foundational concepts have been established from first principles. The architecture is fully understood from `kubectl apply` through the complete execution path to a running Pod serving traffic through a Service. Phase 6 begins the practical application of this knowledge to the project's actual Kubernetes manifests.
