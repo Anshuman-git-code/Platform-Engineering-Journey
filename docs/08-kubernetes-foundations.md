@@ -1190,6 +1190,10 @@ Response returned to browser
 | Services — stable network identity, label selectors | Complete |
 | Service types — ClusterIP, NodePort, LoadBalancer | Complete |
 | kube-proxy — iptables rules implementing Services | Complete |
+| Cluster networking — Pod-to-Pod across Worker Nodes | Complete |
+| CNI plugin model — Kubernetes defines, CNI builds | Complete |
+| kube-proxy crash behavior — rules survive, updates stop | Complete |
+| End-to-end request flow — browser to MySQL and back | Complete |
 | Complete kubectl → browser response flow | Complete |
 
 ### Remaining — Phase 5 to Phase 6
@@ -1205,3 +1209,480 @@ Response returned to browser
 ### Phase 5 Status: Complete
 
 All Kubernetes foundational concepts have been established from first principles. The architecture is fully understood from `kubectl apply` through the complete execution path to a running Pod serving traffic through a Service. Phase 6 begins the practical application of this knowledge to the project's actual Kubernetes manifests.
+
+---
+
+## Cluster Networking — Pod-to-Pod Across Worker Nodes
+
+### Engineering Problem
+
+All networking studied so far has been within a single machine — container namespaces, veth pairs, the Docker bridge, and port publishing rules on one host. In a Kubernetes cluster, Pods on different Worker Nodes must communicate directly. This requires routing between separate Linux machines.
+
+### The Kubernetes Networking Contract
+
+Kubernetes defines one fundamental networking rule:
+
+> Every Pod can communicate directly with every other Pod in the cluster without Network Address Translation (NAT).
+
+This is a specification, not an implementation. Kubernetes itself does not implement the network. It defines the contract and delegates the implementation to a **CNI (Container Network Interface) plugin**.
+
+```
+Kubernetes says:   "Every Pod must have a unique cluster-wide IP,
+                    and any Pod can reach any other Pod directly."
+
+CNI plugin builds: the actual network fabric that satisfies this contract.
+```
+
+Examples of CNI plugins: Calico, Flannel, Cilium, Weave Net. The choice of plugin does not change Kubernetes YAML — it changes how packets physically travel between nodes.
+
+### Why Pod IPs Must Be Globally Unique
+
+If two Worker Nodes both assigned `10.244.1.5` to local Pods, a third Pod sending to `10.244.1.5` would have an ambiguous destination. The routing table could not determine which node — and which Pod — should receive the packet.
+
+Global uniqueness allows the cluster to function as a flat network. Every Worker Node's routing table contains one simple rule per other node: "traffic to `10.244.2.0/24` goes to Worker B." No NAT. No address translation. No overhead.
+
+### Cross-Node Packet Journey — Pod A to Pod B
+
+```
+Worker A:  Pod A  (10.244.1.12)
+Worker B:  Pod B  (10.244.2.18)
+
+Pod A sends packet to 10.244.2.18:5000
+```
+
+**Step 1 — Pod A network namespace**
+
+Pod A's routing table shows `10.244.2.18` is outside its local subnet. Packet exits via `eth0` (the container-side veth endpoint).
+
+**Step 2 — veth pair**
+
+Packet crosses the veth pair from the Pod network namespace into Worker A's root network namespace. Identical to Docker — the veth pair is the bridge between namespace and host.
+
+**Step 3 — Worker A Linux kernel routing**
+
+Worker A's kernel consults its routing table:
+
+```
+10.244.1.0/24  →  local  (Worker A's Pod CIDR)
+10.244.2.0/24  →  Worker B  (installed by CNI plugin)
+```
+
+Destination `10.244.2.18` matches the second rule. Packet forwarded to Worker B via the physical network interface (NIC).
+
+**Step 4 — Physical network**
+
+Packet travels across the physical Ethernet switch between the two servers — identical to any normal IP packet between two machines on the same network.
+
+**Step 5 — Worker B Linux kernel**
+
+Worker B receives the packet. Its routing table shows `10.244.2.18` is local. Packet forwarded to the correct veth pair.
+
+**Step 6 — veth pair → Pod B namespace**
+
+Packet crosses the veth pair into Pod B's network namespace.
+
+**Step 7 — Pod B**
+
+Linux inside Pod B receives the packet on port 5000. The port table maps 5000 to the Node.js process. Express handles the request.
+
+```
+Full path:
+
+Pod A                                           Pod B
+  │                                               │
+  │ eth0 (container)                              │
+  │    ↓                                          │
+  │ veth pair                                     │
+  │    ↓                                          │
+Worker A kernel                            Worker B kernel
+  │    ↓                                          │    ↑
+  │ routing table                          routing table
+  │    ↓                                          │    ↑
+  │ NIC ──────── physical network ────────── NIC
+                                                  │
+                                               veth pair
+                                                  │
+                                              eth0 (container)
+                                                  │
+                                              Express (port 5000)
+```
+
+The packet journey is identical to Docker networking at every step except the physical network segment between machines. The Linux primitives — namespaces, veth pairs, routing tables — are the same. The scale is different.
+
+---
+
+## kube-proxy — How Services Actually Work
+
+### Engineering Problem
+
+A Service is a Kubernetes object stored in etcd. It is metadata. Objects stored in etcd cannot receive TCP packets. When the frontend sends a request to `http://backend-service`, something must convert the stable Service name into an actual Pod IP and forward the packet.
+
+### What kube-proxy Is
+
+kube-proxy is a networking agent running on every Worker Node. It watches the API Server for Service and Endpoint changes and programs the Linux kernel's networking stack so that traffic destined for a Service ClusterIP is transparently redirected to one of the Service's healthy backend Pod IPs.
+
+```
+One kube-proxy per Worker Node:
+
+Worker A: kube-proxy
+Worker B: kube-proxy
+Worker C: kube-proxy
+```
+
+### A Service Is Not a Server
+
+This is the most common misconception about Services:
+
+```
+WRONG mental model:
+Frontend → Service Process → Backend Pod
+
+CORRECT mental model:
+Frontend → Linux Kernel (rules installed by kube-proxy) → Backend Pod
+```
+
+There is no Service daemon. No Service container. No Service VM. The Service is an entry in etcd. kube-proxy reads it and translates it into iptables rules in the Linux kernel.
+
+### What kube-proxy Does — Step by Step
+
+```
+1. Developer creates a Service:
+   kind: Service
+   name: backend-service
+   selector: app: backend
+   port: 5000
+   ClusterIP: 10.96.0.35  (assigned by Kubernetes)
+        │
+        ▼
+2. API Server stores Service in etcd
+
+3. kube-proxy (on every Worker Node) watches API Server
+   Detects: new Service with ClusterIP 10.96.0.35
+        │
+        ▼
+4. kube-proxy programs Linux iptables rules:
+   "If destination == 10.96.0.35:5000,
+    randomly select one of:
+      10.244.1.10 (Pod A)
+      10.244.2.15 (Pod B)
+      10.244.3.18 (Pod C)
+    and rewrite destination to selected Pod IP"
+        │
+        ▼
+5. kube-proxy's job is done.
+   Rules live in the Linux kernel.
+   kube-proxy can crash — rules remain.
+```
+
+### The Complete Service Resolution Flow
+
+```
+Frontend Pod sends: GET http://backend-service/api/users
+
+Step 1: DNS
+  backend-service → ClusterIP 10.96.0.35
+  (kube-dns resolves service name to ClusterIP)
+
+Step 2: Packet created
+  Destination: 10.96.0.35:5000
+
+Step 3: Packet hits Worker Node Linux kernel
+  iptables rule (installed by kube-proxy):
+    10.96.0.35 → rewrite to 10.244.2.15 (Pod B selected)
+
+Step 4: Destination rewritten
+  Original:  10.96.0.35:5000
+  Rewritten: 10.244.2.15:5000
+
+Step 5: Normal Kubernetes routing
+  Worker A → physical network → Worker B → veth → Pod B
+
+Step 6: Express handles request
+  Response returns through reverse path
+```
+
+### kube-proxy Programs Linux; Linux Forwards Packets
+
+```
+API Server
+    │
+    ▼ (configuration — happens once per Service change)
+kube-proxy
+    │ programs
+    ▼
+iptables / IPVS rules in Linux kernel
+    │
+    ▼ (packet forwarding — happens millions of times per second)
+Linux kernel at wire speed
+    │
+    ▼
+Backend Pod
+```
+
+kube-proxy is never in the packet path at runtime. It only configures. This is the same pattern as Docker Engine — Docker installs NAT rules and exits. Linux executes those rules for every packet without Docker's involvement.
+
+### What Happens If kube-proxy Crashes
+
+**Existing networking rules:** Unaffected. Rules live in the Linux kernel, not in kube-proxy's memory. Traffic to existing Services continues flowing normally.
+
+**New Service updates:** Stopped. kube-proxy is the agent that reads new Service definitions and programs corresponding kernel rules. A crashed kube-proxy means new Services become unreachable from that node until kube-proxy is restarted.
+
+This is the control plane / data plane separation in practice. kube-proxy is on the control plane side — configuration. Linux is on the data plane side — packet forwarding. A failure in configuration does not break existing forwarding.
+
+---
+
+## End-to-End Request Flow — Complete System
+
+This is the final integration of all Phase 5 concepts. One user action — clicking Login — traced from browser to database and back.
+
+### The Application Architecture
+
+```
+Browser (user's machine — outside the cluster)
+        │
+        ▼
+Frontend Service (ClusterIP or NodePort/LoadBalancer)
+        │
+        ▼
+Frontend Pod (React + Nginx)
+        │  React bundle executed in browser
+        │  API call generated
+        ▼
+Backend Service (ClusterIP)
+        │
+        ▼
+Backend Pod (Node.js + Express)
+        │
+        ▼
+MySQL Service (ClusterIP)
+        │
+        ▼
+MySQL Pod (mysqld)
+        │
+        ▼
+Persistent Volume (data survives Pod replacement)
+```
+
+### Step-by-Step: User Clicks Login
+
+**Step 1 — Browser → DNS → Frontend Service**
+
+The browser requests `http://my-app.com`. DNS resolves the hostname to the Frontend Service's external IP (LoadBalancer type) or the cluster NodePort. The browser has no knowledge of Pod IPs.
+
+**Step 2 — kube-proxy routes to Frontend Pod**
+
+The packet arrives at a Worker Node with destination matching the Frontend Service ClusterIP. kube-proxy's iptables rules rewrite the destination to a healthy Frontend Pod IP. The packet travels via the standard cross-node routing path.
+
+**Step 3 — Nginx serves the React bundle**
+
+The Frontend Pod runs Nginx. Nginx reads `index.html` and the JavaScript bundle from `/usr/share/nginx/html` (the React production build) and returns them to the browser. The HTML and JavaScript are downloaded and executed by the browser.
+
+**Step 4 — React executes in the browser, user clicks Login**
+
+React renders the login form. The user submits credentials. React sends:
+
+```
+POST http://backend-service/api/auth/login
+{email: ..., password: ...}
+```
+
+React never knows a Pod IP. It knows only the Service name.
+
+**Step 5 — kube-proxy routes to Backend Pod**
+
+DNS resolves `backend-service` to the Backend Service ClusterIP (e.g., `10.96.0.35`). The packet arrives at a Worker Node. kube-proxy's rules rewrite the destination to a Backend Pod IP. Cross-node routing delivers the packet.
+
+**Step 6 — Express handles the login request**
+
+The Backend Pod receives the packet. Express processes `POST /api/auth/login`. The `authController` executes login logic. It needs the database:
+
+```javascript
+const results = await query('SELECT * FROM users WHERE email = ?', [email]);
+```
+
+`api/models/db.js` connects using:
+
+```javascript
+host: process.env.DB_HOST  // "mysql-service"
+```
+
+**Step 7 — kube-proxy routes to MySQL Pod**
+
+DNS resolves `mysql-service` to the MySQL Service ClusterIP. kube-proxy rules rewrite to the MySQL Pod IP. The packet is delivered.
+
+**Step 8 — MySQL executes the query**
+
+The MySQL Pod receives the SQL query. The query executes against the `crud_app` database. The `users` table is stored in a PersistentVolume — data survives any Pod replacement. Results return to Express.
+
+**Step 9 — Response travels back**
+
+Express signs a JWT, constructs the response, and returns it. The response travels back through the reverse path:
+
+```
+MySQL Pod → MySQL Service → Backend Pod → Backend Service → Frontend Pod → Nginx → Browser
+```
+
+The browser receives the JWT and React updates the UI: "Login successful."
+
+### The Complete Flow Diagram
+
+```
+Browser
+    │  GET http://my-app.com
+    ▼
+DNS resolution
+    │  → Frontend Service external IP
+    ▼
+Linux kernel (kube-proxy rules)
+    │  → Frontend Pod IP
+    ▼
+Frontend Pod (Nginx)
+    │  serves React bundle
+    ▼
+Browser executes React
+    │  POST /api/auth/login
+    ▼
+DNS resolution
+    │  backend-service → ClusterIP
+    ▼
+Linux kernel (kube-proxy rules)
+    │  → Backend Pod IP
+    ▼
+Backend Pod (Express)
+    │  authController → db.query()
+    │  DB_HOST=mysql-service
+    ▼
+DNS resolution
+    │  mysql-service → ClusterIP
+    ▼
+Linux kernel (kube-proxy rules)
+    │  → MySQL Pod IP
+    ▼
+MySQL Pod
+    │  SELECT * FROM users WHERE email = ?
+    ▼
+PersistentVolume (/var/lib/mysql)
+    │  query result
+    ▼
+Response travels in reverse through the same path
+    ▼
+Browser receives JWT → React updates UI
+```
+
+### What Is Never in the Packet Path
+
+| Component | Role | In packet path? |
+|---|---|---|
+| API Server | Receives kubectl commands, stores state | No |
+| etcd | Stores cluster state | No |
+| Scheduler | Assigns Pods to Nodes | No |
+| Controller Manager | Reconciles desired vs actual | No |
+| kube-proxy | Programs iptables rules | No (configures, does not forward) |
+| kubelet | Starts containers | No |
+
+At runtime, packets travel through: DNS → Linux kernel → veth pairs → physical network → Linux kernel → application process. The Control Plane is entirely absent from the data path.
+
+### Pattern Recognition Across All Phases
+
+```
+Docker:
+Browser → Host port → Docker iptables rule → Bridge → veth → Container
+
+Docker Compose:
+Frontend Container → Docker DNS → bridge → Backend Container → bridge → MySQL Container
+
+Kubernetes:
+Browser → Service DNS → kube-proxy iptables rule → veth → physical network → veth → Pod
+```
+
+The primitives are identical at every level. Linux namespaces, veth pairs, routing tables, DNS, iptables. The scale changes. The concepts do not.
+
+---
+
+## The Kubernetes Abstraction Ladder
+
+Every phase of this project has introduced one additional layer of abstraction, each solving a problem the layer below could not solve:
+
+```
+Linux Process
+    │  isolated by Docker into:
+    ▼
+Container
+    │  grouped by Kubernetes into:
+    ▼
+Pod (shared network namespace, shared lifecycle)
+    │  count maintained by:
+    ▼
+ReplicaSet (desired replica enforcement)
+    │  version managed by:
+    ▼
+Deployment (rolling updates, rollback, history)
+    │  network identity provided by:
+    ▼
+Service (stable DNS, load balancing, ClusterIP)
+    │  physical routing implemented by:
+    ▼
+kube-proxy + Linux kernel (actual packet forwarding)
+```
+
+Each layer has exactly one responsibility. No layer tries to do what the layer above or below it does. This is why Kubernetes is modular, extensible, and — once understood from first principles — comprehensible.
+
+---
+
+## How Kubernetes Achieves High Availability
+
+Applications achieve high availability in Kubernetes because execution is decoupled from network identity.
+
+Pods are ephemeral. They can be created, destroyed, moved, or replaced at any time. Their IP addresses change with every replacement. Applications never reference Pod IPs directly — they reference Service names. Services provide stable DNS names and ClusterIPs that never change regardless of Pod churn beneath them.
+
+Meanwhile, the Controller Manager continuously reconciles desired and actual state. The ReplicaSet Controller detects when the running Pod count drops below the desired count and requests creation of replacement Pods. The Scheduler places those Pods on healthy nodes. The kubelet starts them. kube-proxy updates the iptables rules to include the new Pod IPs and remove the old ones.
+
+The application receiving traffic never participates in this recovery process. It continues sending requests to `backend-service`. The networking layer — Service, kube-proxy, Linux kernel — transparently routes each request to whichever healthy Pods are currently registered. Failures and recoveries are invisible to the application.
+
+This is how Kubernetes achieves high availability: not by preventing failures, but by making recovery automatic, continuous, and transparent to callers.
+
+---
+
+## Current Status
+
+### Completed
+
+| Topic | Status |
+|---|---|
+| Why Kubernetes exists — the four problems | Complete |
+| Docker vs Docker Compose vs Kubernetes mental model | Complete |
+| The engineering history: Monolith → Microservices → Borg → Kubernetes | Complete |
+| What is a Kubernetes Cluster | Complete |
+| Control Plane vs Worker Node — roles and separation | Complete |
+| Why a centralized Control Plane is necessary | Complete |
+| API Server — purpose, responsibilities | Complete |
+| etcd — cluster memory, stateless / stateful split | Complete |
+| Scheduler — placement decisions | Complete |
+| Desired State model | Complete |
+| kubelet — the Worker Node agent | Complete |
+| Complete end-to-end execution flow | Complete |
+| Component analogy map — Docker to Kubernetes | Complete |
+| Pods — why they exist, shared network namespace | Complete |
+| Pause container — how Pod networking actually works | Complete |
+| Controller Manager — the reconciliation engine | Complete |
+| Reconciliation loop pattern — delta model | Complete |
+| ReplicaSets — desired Pod count enforcement | Complete |
+| Deployments — rolling updates, rollbacks, version management | Complete |
+| Why Deployments create new ReplicaSets rather than modifying existing ones | Complete |
+| Services — stable network identity, label selectors | Complete |
+| Service types — ClusterIP, NodePort, LoadBalancer | Complete |
+| kube-proxy — iptables rules implementing Services | Complete |
+| Cluster networking — Pod-to-Pod across Worker Nodes | Complete |
+| CNI plugin model — Kubernetes defines, CNI builds | Complete |
+| kube-proxy crash behavior — rules survive, updates stop | Complete |
+| End-to-end request flow — browser to MySQL and back | Complete |
+| Kubernetes abstraction ladder | Complete |
+| How Kubernetes achieves high availability | Complete |
+
+### Phase 5 Status: Complete
+
+All Kubernetes foundational concepts have been established from first principles. The complete request path — from a user's browser through DNS, Services, kube-proxy, Linux routing, Pods, Express, and MySQL — is fully understood without any black boxes.
+
+**Next: Phase 6 — Practical Kubernetes**
+
+Phase 6 applies this architecture to the project's actual Kubernetes manifests in `K8s/`. Every YAML field will map to a component whose responsibility is already understood. The focus shifts from "why does this exist?" to "how is this expressed in YAML for this specific project?"

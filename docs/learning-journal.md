@@ -679,3 +679,49 @@ The scale difference matters: in Docker Compose, one container per service. In K
 All Kubernetes foundational concepts are established. The complete execution path from `kubectl apply` through API Server, etcd, Controller Manager, Scheduler, kubelet, containerd, to a running Pod serving traffic through a Service is fully understood from first principles.
 
 Phase 6 applies this understanding to the project's actual Kubernetes manifests in `K8s/`.
+
+---
+
+## Phase 5 — Cluster Networking, kube-proxy, End-to-End Flow
+
+### On Cross-Node Networking Being the Same Primitives at Larger Scale
+
+The cross-node packet journey was easier to understand than expected because every primitive was already familiar: namespaces, veth pairs, routing tables. The only new element was the physical network segment between Worker Nodes — and that is just normal IP routing that Linux has performed since the 1990s.
+
+The CNI plugin insight changed how Kubernetes is perceived. Kubernetes does not own networking. It defines a contract — every Pod gets a unique cluster-wide IP and can reach every other Pod directly. The CNI plugin builds the actual network fabric that satisfies that contract. This is the same delegation model seen throughout Kubernetes: define the interface, delegate the implementation. Container runtime interface for containers. CNI for networking.
+
+---
+
+### On kube-proxy Being a Programmer, Not a Proxy
+
+The name "kube-proxy" implies it sits in the middle of every packet. The reality is more elegant: kube-proxy is a configuration agent that programs Linux iptables rules and then steps out of the way.
+
+This distinction has a concrete consequence. If kube-proxy crashes, existing Services continue working because the kernel rules still exist. New Services become unreachable from that node because no agent is present to add new rules. The failure boundary is precisely defined: control plane configuration is disrupted; data plane forwarding is unaffected.
+
+The same pattern appeared with Docker: Docker Engine installs port forwarding rules. Linux executes them. Docker could crash after the rules are installed and existing containers would continue receiving traffic. The pattern is identical at every level.
+
+---
+
+### On the Abstraction Ladder as a History of Cloud Computing
+
+Looking at the complete abstraction ladder — Linux Process → Container → Pod → ReplicaSet → Deployment → Service → kube-proxy → Linux kernel — it maps almost exactly to the chronology of cloud infrastructure engineering:
+
+Linux gave processes. Docker gave containers. Kubernetes gave everything above that. Each layer was invented to solve a problem the layer below could not solve. Seeing the ladder as a historical progression rather than a static hierarchy makes it easier to understand why each abstraction exists and what specific failure mode it was designed to prevent.
+
+---
+
+### On High Availability Being About Transparency, Not Prevention
+
+The most important insight from the end-to-end flow analysis: Kubernetes does not prevent failures. It makes failures invisible to the systems that depend on the failed component.
+
+A backend Pod crashes. The ReplicaSet creates a replacement. kube-proxy updates the routing rules. The frontend, which only knows `backend-service`, continues sending requests without modification. The failure was real. The recovery was real. The frontend experienced neither.
+
+This is the engineering definition of high availability at the Kubernetes level: not that nothing fails, but that failures are recovered automatically and the recovery is transparent to callers.
+
+---
+
+## Phase 5 — Status: Complete
+
+Phase 5 Kubernetes Fundamentals is fully complete. The entire architecture from cluster creation through the complete request lifecycle has been established from engineering first principles. No black boxes remain.
+
+The transition to Phase 6 means writing YAML — but every field in that YAML maps to a concept already fully understood.
