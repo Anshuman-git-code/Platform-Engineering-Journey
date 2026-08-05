@@ -681,3 +681,65 @@ In this project, credentials are in the Compose file for development convenience
 ### Result
 
 Application code is environment-agnostic. Configuration is supplied at deployment time. The same image runs in development, staging, and production with different configurations.
+
+---
+
+## Phase 5 — Kubernetes Foundations Decisions
+
+## Decision 30 — Understand cluster architecture before writing any Kubernetes YAML
+
+### Context
+
+Kubernetes YAML manifests reference components — Deployments, Services, Pods, ReplicaSets — whose purpose cannot be correctly understood without first understanding the cluster architecture they operate within.
+
+### Decision
+
+Follow the same methodology used for Docker: establish the engineering problem and architectural model before introducing any implementation syntax.
+
+### Reasoning
+
+A Deployment manifest written without understanding the Desired State model, the Scheduler, and the kubelet is a manifest written by memorization. When it fails — and it will fail — there is no mental model to debug from. Understanding the architecture first means every YAML field has a known reason for existing.
+
+### Result
+
+Every Kubernetes concept introduced in Phase 5 was derived from an engineering problem rather than presented as a feature to memorize.
+
+---
+
+## Decision 31 — Separate the Control Plane from Worker Nodes
+
+### Context
+
+Kubernetes requires a decision-making component (Control Plane) and execution components (Worker Nodes) to be on separate machines.
+
+### Decision
+
+Document and accept this architectural separation as a fundamental engineering constraint, not as operational overhead.
+
+### Reasoning
+
+Combining Control Plane and Worker responsibilities on the same machines produces all four failure modes identified during the Phase 5 analysis: split-brain scheduling conflicts, resource blindness, N×N communication overhead, and inability to coordinate global operations. The separation is the engineering solution to those problems, not a complexity imposed by Kubernetes.
+
+### Result
+
+The Control Plane makes cluster-wide decisions without being affected by the resource consumption of workloads. Worker Nodes execute workloads without making cluster-wide scheduling decisions.
+
+---
+
+## Decision 32 — Use the Desired State model as the primary mental model for Kubernetes
+
+### Context
+
+Kubernetes can be approached as a collection of YAML resources to memorize or as a system built around one central idea.
+
+### Decision
+
+Use the Desired State / Actual State reconciliation model as the primary framework for understanding every Kubernetes component.
+
+### Reasoning
+
+Every Kubernetes component — Scheduler, Controller Manager, kubelet — is an implementation of the same loop: observe actual state, compare to desired state, take action to reconcile. Understanding this single model explains why self-healing works, why scaling works, and why rolling updates work — without needing to understand each feature independently.
+
+### Result
+
+Kubernetes becomes a coherent system rather than a list of features. Debugging Kubernetes problems becomes a question of "which component's reconciliation loop is failing?" rather than "which command do I run?"

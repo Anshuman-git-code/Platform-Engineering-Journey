@@ -564,3 +564,62 @@ The complete mental model: source code → image → container → service → s
 ## Docker Track — Status: Complete
 
 All Docker phases are complete. The engineering foundation is established for Kubernetes, where the same concepts — images, containers, services, networking, volumes, declarative descriptions — are extended to multi-node cluster management at production scale.
+
+---
+
+## Phase 5 — Kubernetes Foundations
+
+### On Why Kubernetes Feels Inevitable Once the Problem Is Clear
+
+The most effective framing for Kubernetes was not "here is what Kubernetes does" but "here is what fails at scale without Kubernetes."
+
+Once the four problems — Scheduling, Self-Healing, Scaling, Service Discovery — were stated explicitly, every Kubernetes component stopped feeling like arbitrary complexity. The API Server exists because you need one authoritative entry point to prevent split-brain. etcd exists because the API Server needs to be stateless and restartable. The Scheduler exists because placement decisions require global cluster visibility. The kubelet exists because execution must be local to each machine. Pods exist because co-located containers need a shared execution context.
+
+None of these are inventions. They are solutions to engineering problems that become unavoidable at scale.
+
+---
+
+### On the Desired State Model as a Universal Pattern
+
+The Desired State / Actual State reconciliation loop is not a Kubernetes idea. It appears in:
+
+- Kubernetes: desired Pod count vs running Pod count
+- Terraform: desired infrastructure state vs actual AWS state  
+- Docker Compose: declarative service descriptions
+- React: desired UI state vs rendered DOM
+
+The pattern is: describe what should exist, observe what does exist, compute the difference, apply changes. Understanding it in Kubernetes means recognizing it everywhere.
+
+---
+
+### On the API Server / etcd Split Mirroring the Backend / MySQL Split
+
+The observation that the API Server is stateless and delegates persistence to etcd — and that this mirrors Express being stateless and delegating persistence to MySQL — made the architecture immediately comprehensible.
+
+Express doesn't "remember" user data between restarts. It reads MySQL on every request. The API Server doesn't "remember" cluster state between restarts. It reads etcd on every request. Both are purpose-built to process requests quickly without holding state themselves. Both delegate the persistence concern to a specialized component.
+
+The pattern: stateless request processor + stateful storage backend. It appears at the application layer and at the infrastructure layer.
+
+---
+
+### On kubelet as the Local Agent Pattern
+
+The kubelet is not unique to Kubernetes. Every large distributed system needs local agents on managed machines that receive instructions from a central system, execute them locally, and report status back.
+
+AWS Systems Manager Agent does this for EC2 instances. Puppet/Chef agents do this for configuration management. Prometheus Node Exporter does this for metrics collection.
+
+The pattern: central decision-maker + local agents. The central system knows the global desired state. The local agents know the local actual state. The reconciliation happens at the agent level, locally, without requiring the central system to SSH into machines.
+
+---
+
+### On Pods and Why Kubernetes Didn't Just Reuse Docker's Container Model
+
+Docker manages containers. Kubernetes could have managed containers. The decision to introduce the Pod abstraction instead was an architectural choice: if containers sometimes need to share a network namespace, a volume, and a lifecycle, then the unit that gets scheduled, networked, and managed should be the group — not the individual container.
+
+The Pod is that group. In most deployments, a Pod contains one container. But the abstraction is correct for the general case, and the consistent interface it provides — one IP per Pod, one scheduled unit, one lifecycle — simplifies every other system that interacts with running workloads.
+
+---
+
+## Phase 5 — Status
+
+Phase 5 cluster architecture is complete. The Control Plane components (API Server, etcd, Scheduler, Controller Manager), Worker Node components (kubelet, container runtime), the Desired State model, and the Pod abstraction have all been established from engineering first principles. The remaining Phase 5 topics — ReplicaSets, Deployments, Services, and cluster networking — continue in the next session.
