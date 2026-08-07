@@ -1049,6 +1049,211 @@ project moves to production-grade MySQL configuration.
 
 ---
 
+## Production Engineering — Deferred Improvements
+
+The following improvements are intentionally deferred until the Production Engineering phase.
+They represent standard practices in enterprise Kubernetes environments. Each one was identified
+during Phase 6 and deliberately excluded to preserve the learning philosophy: establish
+functional correctness first, then introduce operational enhancements.
+
+---
+
+### Readiness Probe
+
+**Problem**
+
+A container may start successfully while the application inside it is still initializing —
+establishing a database connection, warming a cache, loading configuration, or running
+migrations. Without a readiness probe, Kubernetes immediately routes traffic to the container.
+Requests fail even though the Pod is technically `Running`.
+
+**Engineering Solution**
+
+A Readiness Probe allows Kubernetes to verify whether the application is actually ready to
+serve requests. Only after the probe succeeds does the EndpointSlice Controller add the Pod
+to the Service's endpoint list.
+
+```
+Pod starts
+    │
+    ▼
+Readiness probe runs
+    │
+    ├── Fails → Service excludes Pod → no traffic
+    └── Passes → Service includes Pod → traffic flows
+```
+
+**Why Deferred**
+
+Phase 6 focuses on architectural understanding. Production health management is addressed
+during Production Engineering after the complete application stack is deployed.
+
+---
+
+### Liveness Probe
+
+**Problem**
+
+Applications can become unhealthy without exiting: deadlocks, infinite loops, hung database
+connections, thread starvation. From Kubernetes' perspective, the container is still `Running`.
+Without monitoring, the application remains broken indefinitely — no self-healing occurs.
+
+**Engineering Solution**
+
+A Liveness Probe periodically checks application health. If repeated checks fail:
+
+```
+Probe fails repeatedly
+    │
+    ▼
+kubelet kills the container
+    │
+    ▼
+Deployment creates a new container
+    │
+    ▼
+Application recovers
+```
+
+This enables automatic recovery without operator intervention.
+
+**Why Deferred**
+
+The application is stable enough for learning. Self-healing behavior through health probes
+is addressed during Production Engineering.
+
+---
+
+### Resource Requests
+
+**Problem**
+
+Without resource requests, the Scheduler has no information about the minimum CPU and memory
+a container requires. It may place too many Pods on the same node, causing CPU starvation,
+memory pressure, and unpredictable performance.
+
+**Engineering Solution**
+
+Resource Requests define the minimum resources required for a Pod to be scheduled. The
+Scheduler reserves these resources before placing the Pod on a node:
+
+```
+spec:
+  containers:
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "256Mi"
+```
+
+**Why Deferred**
+
+This project runs on a single-node Minikube cluster where resource contention is minimal
+during learning.
+
+---
+
+### Resource Limits
+
+**Problem**
+
+A software bug may cause uncontrolled CPU or memory consumption. Without limits, one container
+can consume nearly all node resources, affecting every workload on that node — the
+"noisy-neighbour" problem.
+
+**Engineering Solution**
+
+Resource Limits define the maximum resources a container may consume. If memory exceeds the
+limit, Kubernetes terminates the container (OOMKill). If CPU exceeds the limit, usage is
+throttled.
+
+**Why Deferred**
+
+Current focus is application architecture rather than cluster resource governance.
+Resource management is addressed in Production Engineering.
+
+---
+
+### Rolling Updates
+
+**Problem**
+
+Updating a Deployment by replacing all Pods simultaneously causes downtime. Users experience
+service interruption until the new version starts.
+
+**Engineering Solution**
+
+Deployments support rolling updates. Each Pod is replaced one at a time:
+
+```
+v1 v1 v1
+    │
+    ▼  (start one new Pod)
+v1 v1 v2  (health check passes)
+    │
+    ▼  (remove one old Pod)
+v1 v2 v2
+    │
+    ▼  (repeat)
+v2 v2 v2  (zero downtime, full transition)
+```
+
+This was demonstrated conceptually in Phase 5. The practical implementation — including
+`maxSurge`, `maxUnavailable`, and observing two ReplicaSets during a transition — belongs
+to Production Engineering.
+
+**Why Deferred**
+
+Only initial deployments were required during the learning phase.
+
+---
+
+### Rollbacks
+
+**Problem**
+
+A newly deployed version may introduce bugs, performance regressions, or startup failures.
+Without rollback capability, manual recovery is slow and error-prone.
+
+**Engineering Solution**
+
+Kubernetes automatically preserves Deployment revision history. A previous ReplicaSet is
+never deleted — it is scaled to zero. Rollback scales it back up:
+
+```
+backend:v2 fails
+    │
+    ▼
+ReplicaSet v1 (scaled to 0, preserved)
+ReplicaSet v2 (failing, scale down)
+    │
+    ▼
+ReplicaSet v1 (scale back to 3)
+    │
+    ▼
+Application restored — zero additional image pull
+```
+
+**Why Deferred**
+
+Covered conceptually in Phase 5. Practical rollback procedures are part of Production
+Engineering and CI/CD pipeline design.
+
+---
+
+### Engineering Decision
+
+These features were intentionally deferred to preserve the project's learning philosophy.
+The primary objective of Phase 6 was to understand Kubernetes architecture, networking,
+storage, and application deployment from first principles.
+
+Establishing functional correctness — Namespace, ConfigMap, Secret, PVC, Deployment,
+Service, DNS, database initialization, end-to-end connectivity — before introducing
+operational enhancements mirrors real engineering practice. A system that is correctly
+understood is a system that can be reliably improved.
+
+---
+
 ## Current Status
 
 ### Completed
@@ -1074,15 +1279,27 @@ project moves to production-grade MySQL configuration.
 | Debugging: Pending Pod — missing PVC | Complete |
 | Debugging: MySQL one-time initialization behavior | Complete |
 | Debugging: Rolling restart — old Pod logs observed | Complete |
+| Deferred improvements — Readiness Probe, Liveness Probe | Documented |
+| Deferred improvements — Resource Requests, Limits | Documented |
+| Deferred improvements — Rolling Updates, Rollbacks | Documented |
 
-### Remaining — Phase 6 Continuation
+### Phase 6 Status: Complete
 
-| Topic | Status |
-|---|---|
-| Frontend Deployment | Pending |
-| Frontend Service | Pending |
-| End-to-end browser test (frontend → backend → MySQL) | Pending |
-| Self-healing investigation (delete Pod, watch ReplicaSet) | Pending |
-| Scaling exercise (`replicas: 3`) | Pending |
-| Rolling update exercise (`backend:v1` → `backend:v2`) | Pending |
-| Engineering retrospective | Pending |
+Phase 6 is closed. MySQL and the backend API are deployed and verified on Minikube.
+The full dependency chain — Namespace → ConfigMap → Secret → PVC → MySQL → Backend —
+is running and communicating correctly through Kubernetes DNS and Services.
+
+**Updated Roadmap:**
+
+| Phase | Topic | Status |
+|---|---|---|
+| Phase 0 | Engineering Investigation | ✅ |
+| Phase 1 | Docker Foundations | ✅ |
+| Phase 2 | Backend Containerization | ✅ |
+| Phase 3 | Frontend Containerization | ✅ |
+| Phase 4 | Docker Compose | ✅ |
+| Phase 5 | Kubernetes Fundamentals | ✅ |
+| Phase 6 | Backend on Kubernetes | ✅ |
+| Phase 7 | Frontend on Kubernetes | ➡️ Next |
+| Phase 8 | CI/CD Pipeline | ⏳ |
+| Future | Production Engineering | ⏳ |
