@@ -725,3 +725,43 @@ This is the engineering definition of high availability at the Kubernetes level:
 Phase 5 Kubernetes Fundamentals is fully complete. The entire architecture from cluster creation through the complete request lifecycle has been established from engineering first principles. No black boxes remain.
 
 The transition to Phase 6 means writing YAML — but every field in that YAML maps to a concept already fully understood.
+
+---
+
+## Phase 6 — Kubernetes Deployment
+
+### On Deriving the Deployment Manifest Before Seeing YAML
+
+The exercise of predicting Deployment manifest contents before opening a file produced a result that was architecturally sound even if the syntax was imprecise. The key insight was that a Deployment must contain a Pod template — not existing Pods. This distinction mirrors the Docker image/container relationship exactly: an image is a blueprint for containers; a Deployment template is a blueprint for Pods.
+
+The prediction exercise also revealed a common misconception: placing all application services inside one Deployment. Each service (backend, frontend, MySQL) needs its own Deployment because their lifecycles are independent. A crashed backend Pod should not trigger a MySQL Pod restart.
+
+---
+
+### On Secrets and ConfigMaps as the Kubernetes Configuration Separation
+
+The `valueFrom: secretKeyRef` and `valueFrom: configMapKeyRef` patterns solved a problem that existed even in Phase 0 — credentials embedded in `.env` files checked into repositories. The Kubernetes model cleanly separates:
+
+- Application code (Deployment) — version controlled, no credentials
+- Non-sensitive configuration (ConfigMap) — environment-specific values
+- Sensitive configuration (Secret) — credentials, never in manifests
+
+The consequence: the same Deployment YAML can be applied to development and production by changing only the Secret and ConfigMap objects in each namespace. The Deployment itself never changes. The image never changes. Only the injected values differ.
+
+---
+
+### On the Declarative Mental Model as a Permanent Shift
+
+Writing `replicas: 3` in Docker Compose and writing `replicas: 3` in Kubernetes look identical but mean different things.
+
+In Docker Compose on a single machine, `replicas: 3` starts 3 containers. If one dies, the restart policy handles it locally.
+
+In Kubernetes, `replicas: 3` is a declaration that the desired state of the cluster permanently includes 3 backend Pods. The Controller Manager continuously reconciles reality against this declaration — on any node, after any failure, after any deployment. The declaration outlives any individual Pod, any individual Node, and any individual component failure.
+
+The shift from "run this" to "this should always exist" is the most important conceptual change in moving from Docker to Kubernetes.
+
+---
+
+## Phase 6 — Status: In Progress
+
+Backend Deployment manifest analyzed and written. Backend Service, MySQL stack (Secret, ConfigMap, PVC, Deployment, Service), and Frontend Deployment and Service continue in the next session.

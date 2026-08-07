@@ -1,0 +1,2 @@
+# Docker — additional Docker configurations and shared utilities (future use)
+# Application Dockerfiles live in api/ and client/ alongside their source code
