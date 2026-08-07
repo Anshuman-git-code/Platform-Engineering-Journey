@@ -872,3 +872,87 @@ Service, DNS, kube-proxy — participated in producing those three log lines.
 
 MySQL and backend are deployed and verified. Frontend deployment, self-healing investigation,
 scaling exercise, and rolling update observation continue in the next session.
+
+---
+
+## Phase 7 — Frontend on Kubernetes and Ingress
+
+### On Build-Time vs Runtime Environment Variables
+
+The distinction between React's build-time environment variables and Kubernetes's runtime
+injection was the most important conceptual gap in Phase 7. Every backend environment variable
+in this project is read at container start via `process.env`. The same mental model applied
+to the frontend produced a wrong deployment that appeared correct.
+
+React's Webpack build inlines every `process.env.REACT_APP_*` reference as a literal string
+during `npm run build`. The resulting JavaScript has no `process.env` calls — only string
+constants. Kubernetes `env:` injections happen after the image is built. By the time the
+container starts, the bundle is already compiled and static. Nginx serves it without executing
+any Node.js.
+
+This is the reason the `v2` image failed silently — the `env:` field in the Deployment had
+no effect. The bundle still contained `http://localhost:5000` from the previous build.
+
+---
+
+### On Why Internal DNS Should Never Appear in Browser-Facing Code
+
+`ERR_NAME_NOT_RESOLVED` for `http://backend:5000` was the moment Kubernetes networking became
+fully concrete. The hostname `backend` resolves correctly from inside the cluster via CoreDNS.
+It does not resolve on the Mac's DNS because it is not a real hostname — it only exists in
+the private virtual network created by Kubernetes.
+
+The correct pattern is that the browser communicates with a stable, external hostname
+(`crud.local` in development, a real domain in production). The Ingress translates that
+hostname into internal routing decisions. The browser never needs to know that `backend` or
+`mysql` exist.
+
+---
+
+### On the Duplicate `/api` Prefix Bug
+
+This was an easy bug to make and a clarifying bug to fix. `baseURL: '/api'` means every
+request path is appended to `/api`. If a call site says `axios.post('/api/auth/register')`,
+the resulting URL is `/api/api/auth/register`. The path structure only makes sense when you
+see `baseURL` and the call site together — neither is wrong in isolation.
+
+The fix was straightforward once the rule was clear: when `baseURL` ends with `/api`, call
+sites must start with the resource path, not repeat the prefix.
+
+---
+
+### On the Stale Connection as a Kubernetes Lesson
+
+The 500 error from a stale MySQL connection arrived at the best possible moment — after the
+entire Kubernetes infrastructure was verified working. The debugging sequence ruled out every
+infrastructure layer (networking, DNS, Service, ConfigMap, Secret, PVC) before concluding
+that the problem was in application code.
+
+The root cause — `mysql.createConnection()` creating one persistent TCP connection that dies
+when the upstream Pod restarts — is a correct Kubernetes behavior observation. Kubernetes
+ephemeral Pods restart. Applications must anticipate this. The fix (restart the backend to
+establish a fresh connection) works but is not the production solution. A connection pool
+(`mysql.createPool()`) handles dropped connections automatically, without operator intervention.
+
+This is the practical difference between "it works" and "it is production-grade."
+
+---
+
+### On Rolling Updates Becoming Visible
+
+By the end of Phase 7, `kubectl describe deployment frontend` showed three ReplicaSets —
+one per image version deployed (v2, v3, v4). Each update created a new ReplicaSet rather than
+modifying the existing one. The event log showed the exact sequence: scale up new, scale down
+old, one Pod at a time.
+
+Phase 5 described this mechanism abstractly. Phase 7 made it observable in a live cluster.
+The same events that were drawn as boxes in diagrams appeared as timestamped entries in
+`kubectl describe`. This is the value of building the complete stack rather than running
+isolated examples.
+
+---
+
+## Phase 7 — Status: Complete
+
+The complete three-tier application runs end-to-end on Kubernetes. Register, login, and
+user management all function through the Ingress at `http://crud.local`. Phase 8 is CI/CD.

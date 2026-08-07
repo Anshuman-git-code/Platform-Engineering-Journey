@@ -1,27 +1,32 @@
-# Ingress — Phase 8+ (to be completed)
-# Routes external traffic to frontend and backend services
-# Requires an Ingress Controller (e.g., nginx-ingress) installed in the cluster
 apiVersion: networking.k8s.io/v1
 kind: Ingress
+
 metadata:
-  name: app-ingress
+  name: crud-app-ingress
   namespace: prod
-  annotations:
-    nginx.ingress.kubernetes.io/rewrite-target: /
+
 spec:
+  ingressClassName: nginx
+
   rules:
-    - host: my-app.example.com
+    - host: crud.local
+
       http:
+
         paths:
+
           - path: /
             pathType: Prefix
+
             backend:
               service:
                 name: frontend
                 port:
                   number: 80
+
           - path: /api
             pathType: Prefix
+
             backend:
               service:
                 name: backend

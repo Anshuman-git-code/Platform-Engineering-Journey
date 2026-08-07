@@ -12,6 +12,9 @@ RUN npm ci
 # 📦 Now copy the rest of your app source
 COPY . .
 
+ARG REACT_APP_API
+ENV REACT_APP_API=$REACT_APP_API
+
 # 🏗️ Build the React app (generates static files in /build)
 RUN npm run build
 
