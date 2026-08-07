@@ -765,3 +765,110 @@ The shift from "run this" to "this should always exist" is the most important co
 ## Phase 6 — Status: In Progress
 
 Backend Deployment manifest analyzed and written. Backend Service, MySQL stack (Secret, ConfigMap, PVC, Deployment, Service), and Frontend Deployment and Service continue in the next session.
+
+---
+
+## Phase 6 — Kubernetes Practical Deployment
+
+### On Seeing the Control Plane as Pods
+
+The most striking observation when `kubectl get pods -A` returned `kube-apiserver-minikube`,
+`etcd-minikube`, `kube-scheduler-minikube`, and `kube-controller-manager-minikube` was that
+these are not daemons managed by systemd. They are Pods. The same object type used for
+application workloads is used for Kubernetes itself.
+
+This means the Kubernetes architecture is recursive — Kubernetes manages itself using the same
+primitives it provides to applications. It also means debugging the control plane uses the
+same tools as debugging application Pods: `kubectl logs`, `kubectl describe`, `kubectl exec`.
+
+---
+
+### On ConfigMap as a File — A Different Usage Pattern
+
+Until Phase 6, ConfigMaps were only used for environment variable injection. The MySQL
+initialization requirement introduced the second usage pattern: mounting a ConfigMap key as a
+physical file inside a container's filesystem.
+
+The mental model that made this clear: Kubernetes is a delivery mechanism. `MYSQL_DATABASE`
+is delivered as a string in the process environment. `init.sql` is delivered as bytes at a
+filesystem path. Same object type, different delivery mechanism, completely different
+application behavior.
+
+The application (MySQL) never knows either value came from Kubernetes. It reads environment
+variables through standard Linux `getenv()`. It reads files through standard Linux `open()`.
+Kubernetes is invisible at the application layer.
+
+---
+
+### On the MySQL One-Time Initialization Trap
+
+The most practically important debugging lesson in Phase 6: the MySQL Docker image's
+initialization scripts run exactly once — when the data directory is empty. Every subsequent
+start skips them to protect existing data.
+
+This means the sequence matters precisely:
+1. PVC must be empty (never initialized)
+2. Deployment must include the `initdb` volume mount
+3. MySQL starts for the first time with both conditions true
+
+Applying the ConfigMap mount after MySQL had already initialized produced no visible error —
+MySQL silently ignored the SQL file. The only way to force re-execution was to delete the PVC
+(destroying all data) and start fresh. In production, this would be a database migration tool
+(Flyway, Liquibase) or a Kubernetes Job — never a destructive PVC delete.
+
+---
+
+### On the Pending Pod as a Safety Mechanism
+
+When the PVC was deleted and the Deployment was reapplied, the Pod stayed `Pending`
+indefinitely with `FailedScheduling: persistentvolumeclaim "mysql-pvc" not found`.
+
+The first instinct was to treat this as a failure. It is the opposite. The Scheduler is
+refusing to place a Pod that cannot satisfy its declared dependencies. A Pod that started
+without its required storage would write data to the ephemeral container layer — appearing
+to work until the first restart destroys everything.
+
+Kubernetes's refusal to schedule an incomplete Pod is not an error condition. It is a
+correctness guarantee.
+
+---
+
+### On the Rolling Restart Log Observation
+
+`kubectl rollout restart` creates a new Pod while keeping the old one alive. Running
+`kubectl logs deployment/backend` during the transition returned logs from the terminating
+old Pod — complete with the old error. This looked like the fix had not worked.
+
+The lesson: `kubectl logs deployment/NAME` is non-deterministic when multiple versions of a
+Pod are running during a rollout. The command returns logs from whichever Pod it selects.
+The correct approach during a rollout is to specify the exact new Pod name, or wait for
+the rollout to complete before checking logs.
+
+---
+
+### On the Entire Stack Coming Together
+
+When `kubectl logs -n prod deployment/backend` finally showed:
+```
+🚀 Server running on http://0.0.0.0:5000
+MySQL Connected
+✅ Admin user created: admin@example.com / admin123
+```
+
+each line mapped to a specific Kubernetes component:
+
+- `Server running` — kubelet started the container, containerd ran Node.js, Express bound port 5000
+- `MySQL Connected` — CoreDNS resolved `mysql`, kube-proxy forwarded to the MySQL Pod, the Secret's
+  password authenticated successfully
+- `Admin user created` — the `users` table from `init.sql` exists, the INSERT succeeded, the PVC
+  persisted the data
+
+The entire stack — Namespace, ConfigMap, Secret, PVC, StorageClass, Deployment, ReplicaSet,
+Service, DNS, kube-proxy — participated in producing those three log lines.
+
+---
+
+## Phase 6 — Status: In Progress
+
+MySQL and backend are deployed and verified. Frontend deployment, self-healing investigation,
+scaling exercise, and rolling update observation continue in the next session.

@@ -1,5 +1,3 @@
-# MySQL Deployment — Phase 6 (to be completed)
-# Pending: PVC, Secret, and ConfigMap must be applied first
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -20,23 +18,29 @@ spec:
       containers:
         - name: mysql
           image: mysql:8
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 3306
           env:
             - name: MYSQL_ROOT_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: mysql-secret
-                  key: root-password
+                  name: backend-secret
+                  key: DB_PASSWORD
             - name: MYSQL_DATABASE
               valueFrom:
                 configMapKeyRef:
-                  name: mysql-config
-                  key: database
+                  name: backend-config
+                  key: DB_NAME
           volumeMounts:
             - name: mysql-storage
               mountPath: /var/lib/mysql
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
       volumes:
         - name: mysql-storage
           persistentVolumeClaim:
             claimName: mysql-pvc
+        - name: initdb
+          configMap:
+            name: mysql-initdb-config

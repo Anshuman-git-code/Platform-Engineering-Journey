@@ -6,7 +6,7 @@ metadata:
   labels:
     app: backend
 spec:
-  replicas: 3
+  replicas: 1
   selector:
     matchLabels:
       app: backend
@@ -17,28 +17,35 @@ spec:
     spec:
       containers:
         - name: backend
-          image: anshuman0506/backend:latest
+          image: backend:v2
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 5000
           env:
             - name: DB_HOST
-              value: mysql
-            - name: DB_USER
-              value: root
-            - name: DB_PASSWORD
               valueFrom:
-                secretKeyRef:
-                  name: mysql-secret
-                  key: password
+                configMapKeyRef:
+                  name: backend-config
+                  key: DB_HOST
+            - name: DB_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: backend-config
+                  key: DB_USER
             - name: DB_NAME
               valueFrom:
                 configMapKeyRef:
-                  name: mysql-config
-                  key: database
+                  name: backend-config
+                  key: DB_NAME
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secret
+                  key: DB_PASSWORD
             - name: JWT_SECRET
               valueFrom:
                 secretKeyRef:
                   name: backend-secret
-                  key: jwt-secret
+                  key: JWT_SECRET
             - name: RESET_ADMIN_PASS
               value: "true"
