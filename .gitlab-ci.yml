@@ -1,0 +1,14 @@
+stages:
+  - verify
+
+runner-verification:
+  stage: verify
+  tags:
+    - macos
+  script:
+    - echo "GitLab Runner is working"
+    - git --version
+    - docker --version
+    - kubectl version --client
+    - minikube status
+    
