@@ -38,10 +38,22 @@ The tiers are separated into independent layers. Each layer has a distinct respo
 | Phase | Title | Status |
 |---|---|---|
 | Phase 0 | Understanding an Unknown Codebase Before Infrastructure Modernization | ✅ Complete |
-| Phase 1 | Containerization with Docker | Not started |
-| Phase 2 | Orchestration with Kubernetes | Not started |
-| Phase 3 | CI/CD Pipeline Implementation | Not started |
-| Phase 4 | Production Deployment | Not started |
+| Phase 1 | Docker Foundations | ✅ Complete |
+| Phase 2A | Image Construction | ✅ Complete |
+| Phase 2B | Backend Containerization | ✅ Complete |
+| Phase 3 | Frontend Containerization | ✅ Complete |
+| Phase 4 | Docker Compose | ✅ Complete |
+| Phase 5 | Kubernetes Fundamentals | ✅ Complete |
+| Phase 6 | Kubernetes Application Deployment | ✅ Complete |
+| Phase 7 | Frontend on Kubernetes + NGINX Ingress | ✅ Complete |
+| Phase 8 | GitLab CI/CD | 🚧 Phase 8A Complete |
+| Phase 9 | Production Kubernetes Hardening | ⏳ |
+| Phase 10 | Helm | ⏳ |
+| Phase 11 | Terraform | ⏳ |
+| Phase 12 | AWS EKS | ⏳ |
+| Phase 13 | Production Ingress + TLS | ⏳ |
+| Phase 14 | Monitoring — Prometheus + Grafana | ⏳ |
+| Phase 15 | Notifications — Slack | ⏳ |
 
 ---
 

@@ -743,3 +743,115 @@ Every Kubernetes component — Scheduler, Controller Manager, kubelet — is an 
 ### Result
 
 Kubernetes becomes a coherent system rather than a list of features. Debugging Kubernetes problems becomes a question of "which component's reconciliation loop is failing?" rather than "which command do I run?"
+
+---
+
+## Phase 8 — GitLab CI/CD Decisions
+
+## Decision 30 — Use GitLab CI/CD instead of Jenkins
+
+### Context
+
+The original reference project uses Jenkins as the CI/CD orchestration platform. Jenkins
+requires a separate server, installation, and webhook configuration.
+
+### Decision
+
+Use GitLab CI/CD as the pipeline platform for this project, replacing Jenkins while
+preserving the same DevSecOps pipeline responsibilities.
+
+### Reasoning
+
+The project already uses GitLab for repository hosting. GitLab CI/CD is native to the
+platform — the pipeline definition lives in `.gitlab-ci.yml` alongside the application code,
+is version-controlled, and is tied to merge requests and commits without additional
+configuration.
+
+Jenkins would require provisioning a separate server, maintaining a separate authentication
+system, and configuring webhooks between GitHub/GitLab and Jenkins. For a project focused
+on engineering concepts rather than tool administration, this overhead is not justified.
+
+The same DevSecOps responsibilities are preserved: GitLeaks, SonarQube, Trivy FS, Docker
+Build, Trivy Image, Docker Hub push, Kubernetes deployment, and verification.
+
+### Tradeoff
+
+Jenkins is more widely used in enterprise environments. Omitting it means the project does
+not demonstrate Jenkins-specific pipeline configuration. This is accepted because the
+pipeline engineering concepts — stages, security scanning, Docker integration, and
+Kubernetes deployment — transfer directly regardless of the orchestration tool.
+
+### Result
+
+GitLab CI/CD pipeline in `.gitlab-ci.yml`. Consistent with repository hosting. No
+additional infrastructure required beyond the self-hosted runner.
+
+---
+
+## Decision 31 — Use shell executor for the macOS self-hosted runner
+
+### Context
+
+GitLab Runner supports multiple executors: shell, Docker, Docker+Machine, Kubernetes,
+and others. The runner is installed on Apple Silicon macOS.
+
+### Decision
+
+Use the shell executor.
+
+### Reasoning
+
+The shell executor runs pipeline jobs directly on the Mac host with the user's environment.
+This gives jobs immediate access to Docker Engine, kubectl, and the Minikube cluster that
+has been built and verified throughout Phases 1–7. No additional configuration is required
+to make these tools available to the pipeline.
+
+Alternative executors (Docker executor, Docker-in-Docker) would require either a
+Docker-in-Docker setup with additional socket mounting, or a separate container image
+pre-installed with kubectl and Minikube — adding complexity that is not justified for a
+local learning environment.
+
+### Tradeoff
+
+The shell executor provides significantly less isolation than container executors. Pipeline
+jobs run with host-level access. This is acceptable for a local Minikube environment. For
+production deployments to AWS EKS, a container executor with proper IAM credentials and
+secret management would be required.
+
+### Result
+
+Pipeline jobs access Docker, kubectl, and Minikube without additional configuration.
+The tradeoff (reduced isolation) is documented and accepted for the current scope.
+
+---
+
+## Decision 32 — Maintain GitHub and GitLab as separate remotes
+
+### Context
+
+The project was originally hosted only on GitHub. GitLab is being added as the CI/CD
+platform.
+
+### Decision
+
+Maintain both remotes simultaneously: `origin` (GitHub) and `gitlab` (GitLab). Push to
+both as appropriate.
+
+### Reasoning
+
+GitHub serves as the public portfolio repository — it is where the engineering documentation,
+the engineering journal, and the phase history are visible to the public. GitLab serves as
+the CI/CD platform — it is where pipelines run and runner configuration lives.
+
+Abandoning GitHub would lose the public portfolio value. Abandoning GitLab would require
+a different CI/CD platform. Maintaining both preserves the purpose of each.
+
+### Result
+
+```
+origin   → GitHub (public portfolio)
+gitlab   → GitLab (CI/CD platform)
+```
+
+Each push to `gitlab main` triggers the pipeline. Pushes to `origin main` update the
+public documentation.

@@ -956,3 +956,61 @@ isolated examples.
 
 The complete three-tier application runs end-to-end on Kubernetes. Register, login, and
 user management all function through the Ingress at `http://crud.local`. Phase 8 is CI/CD.
+
+---
+
+## Phase 8 — GitLab CI/CD Foundation
+
+### On the Shell Executor Giving Direct Mac Access
+
+The most practically interesting aspect of Phase 8A was watching the first GitLab pipeline
+job execute and seeing `Docker version 29.6.0` and `kubectl version v1.33.2` in the job
+output. The pipeline job was running on the Mac — the same machine where the Docker images
+were built in Phase 2 and the Kubernetes cluster was deployed in Phase 6.
+
+The shell executor's access model is the exact opposite of how production CI/CD should
+work. In production, the pipeline would have scoped, credential-managed access to specific
+resources. Here, the runner has everything the Mac user has. That is a security concern in
+production — and a convenience in local development that makes the pipeline immediately
+functional without configuration overhead.
+
+Recognizing which tradeoffs are acceptable at which stage is part of engineering judgment.
+
+---
+
+### On the Minikube Docker Socket Error Being Diagnostic, Not Fatal
+
+`minikube status` returned an error referencing
+`/Users/anshumanmohapatra/.colima/default/docker.sock` — a Colima socket path rather than
+Docker Desktop's socket path. The job still succeeded because `minikube status` exiting
+with a non-zero code did not cause the job to fail (the script continued).
+
+The error is informative: it means Minikube was previously started with Colima as the
+driver, and that context persists in Minikube's configuration. When the deployment pipeline
+is built, the active Docker context will need to be aligned — either by starting Minikube
+with Docker Desktop as the driver, or by setting the Docker context explicitly in the
+pipeline job.
+
+This is the kind of environment-specific detail that appears when running CI/CD on a
+developer machine rather than a dedicated CI server. The pipeline exposed it. The
+documentation records it. The fix will be applied when the deployment stage is built.
+
+---
+
+### On GitLab as Platform vs Jenkins as Platform
+
+The choice between GitLab CI/CD and Jenkins is not purely technical — it is also an
+operational question. Jenkins requires infrastructure to run. GitLab CI/CD requires only
+a runner. For a project where the engineering value is in the pipeline content (what it
+does) rather than the pipeline platform (what runs it), minimizing operational overhead
+is the right tradeoff.
+
+The pipeline responsibilities — security scanning, image building, registry push, and
+Kubernetes deployment — are the same regardless of platform. The skills transfer.
+
+---
+
+## Phase 8 — Status: In Progress (Phase 8A Complete)
+
+Runner is operational, Docker and kubectl are accessible, first pipeline succeeded.
+Phase 8B begins the real DevSecOps pipeline: compilation verification and GitLeaks.
