@@ -1,6 +1,7 @@
 stages:
   - verify
   - validate
+  - secret-scan
 
 # ─────────────────────────────────────────────────────
 # Phase 8A — Runner Verification
@@ -55,3 +56,40 @@ validate-backend:
     - echo "Validating backend JavaScript syntax..."
     - find api -name "*.js" -not -path "*/node_modules/*" -exec node --check {} +
     - echo "Backend validation passed."
+
+# ─────────────────────────────────────────────────────
+# Phase 8.6 — GitLeaks Secret Scanning
+#
+# Engineering problem:
+#   A developer may accidentally commit credentials,
+#   API keys, tokens, or private keys in application
+#   source code. Once pushed, a secret in Git history
+#   is effectively compromised regardless of whether
+#   the file is later deleted. Detecting secrets before
+#   the image is built prevents embedding them in
+#   container layers where they would be permanently
+#   accessible to anyone who can pull the image.
+#
+# Why --no-git --source ./client/src and ./api:
+#   gitleaks detect (with git) scans git history and
+#   detects example tokens in documentation (e.g. JWT
+#   examples in docs/). That produces false positives
+#   on this project. Scoping to application source
+#   directories only (client/src, api) targets the
+#   code that will be compiled into Docker images.
+#   --no-git scans filesystem content only, which is
+#   the correct behavior for a pre-build source check.
+#
+# Exit code 1 ensures the pipeline fails if a real
+# secret is detected in application source.
+# ─────────────────────────────────────────────────────
+gitleaks-scan:
+  stage: secret-scan
+  tags:
+    - macos
+  script:
+    - echo "Scanning frontend source for secrets..."
+    - gitleaks detect --source ./client/src --no-git --exit-code 1
+    - echo "Scanning backend source for secrets..."
+    - gitleaks detect --source ./api --no-git --exit-code 1
+    - echo "GitLeaks scan passed — no secrets detected in application source."
