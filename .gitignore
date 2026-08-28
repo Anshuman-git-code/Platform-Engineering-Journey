@@ -17,3 +17,9 @@ client/build/
 # Editor
 .vscode/
 .idea/
+
+# Development Phase artifacts
+3-Tier DevSecOps Project
+
+# Internal AI workflow state
+docs/internal/
