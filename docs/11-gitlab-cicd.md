@@ -386,3 +386,112 @@ The foundation for Phase 8B is confirmed.
 | 8I | Deliberate failure and debugging exercises | Pending |
 
 ### Phase 8 Status: In Progress — Phase 8A Complete
+
+---
+
+## Phase 8.5 — Validation / Compilation
+
+### Engineering Problem
+
+A syntax error in application source code produces a failure at container startup, not at
+image build time. `docker build` succeeds because it copies files without executing them.
+The error only surfaces when the container starts and the Node.js runtime attempts to parse
+the broken file. At that point, the error is deep in the pipeline — after a potentially
+expensive image build and push.
+
+Catching syntax errors before any build is cheap: `node --check` parses JavaScript without
+executing it. It requires only the Node.js binary. No `npm install`, no build tools, no
+dependencies. It runs in seconds and gates the entire pipeline.
+
+### Why `node --check` Instead of `npm test`
+
+The frontend `package.json` has a `test` script (`react-scripts test --watchAll=false`) and
+the backend has no test script at all. Both require `npm install` to populate `node_modules`
+before they can run, which would need an additional pipeline step.
+
+`node --check` needs nothing beyond the Node.js binary already present on the shell executor.
+It is the equivalent of the reference project's "Frontend compilation" and "Backend
+compilation" stages — syntax validation before any expensive operation.
+
+### Pipeline Architecture
+
+```
+git push → GitLab
+        │
+        ▼
+Self-hosted Runner (shell executor, macOS tag)
+        │
+        ├── Stage: verify
+        │     └── runner-verification (confirms Docker, kubectl reachable)
+        │
+        └── Stage: validate
+              ├── validate-frontend
+              │     find client/src -name "*.js" -not -path "*/node_modules/*" -exec node --check {} +
+              └── validate-backend
+                    find api -name "*.js" -not -path "*/node_modules/*" -exec node --check {} +
+```
+
+### Jobs
+
+**`validate-frontend`**
+Scans all JavaScript files under `client/src/`, excluding `node_modules`. Uses `node --check`
+which parses each file for syntax errors without executing it. The `find ... -exec ... {} +`
+form passes all matched files to a single `node --check` invocation, which exits non-zero
+if any file contains a syntax error.
+
+**`validate-backend`**
+Same approach applied to `api/`. Covers `app.js`, all controllers, middleware, models, and
+routes. The `node_modules/` directory is excluded — it contains vendored code, not
+application source.
+
+### Local Verification
+
+Both commands were verified locally before pipeline implementation:
+
+```bash
+find client/src -name "*.js" -not -path "*/node_modules/*" -exec node --check {} +
+# → FRONTEND: all JS files valid (exit 0)
+
+find api -name "*.js" -not -path "*/node_modules/*" -exec node --check {} +
+# → BACKEND: all JS files valid (exit 0)
+```
+
+Node.js version on runner: `v24.3.0`
+
+### GitLab Pipeline Verification
+
+Pipeline `2798839328` executed on commit `88d9e77`. Runner log confirmed all three jobs:
+
+| Job ID | Job Name | Status | Duration |
+|---|---|---|---|
+| 16163189133 | runner-verification | success | 5.68s |
+| 16163189134 | validate-frontend | success | 4.74s |
+| 16163189135 | validate-backend | success | 3.35s |
+
+Evidence from `gitlab-runner.err.log`:
+```
+job=16163189134 job-status=success   (validate-frontend)
+job=16163189135 job-status=success   (validate-backend)
+```
+
+### Production Considerations
+
+`node --check` validates syntax only. It does not validate:
+- Runtime logic errors
+- Missing module imports (surface at container startup)
+- React JSX syntax (handled by `react-scripts build` in Phase 8.11)
+- TypeScript type errors (not applicable — project uses plain JavaScript)
+
+A more comprehensive validation would add `npm ci` + `npm test` in a separate stage. This
+is deferred to a future pipeline hardening iteration after the core DevSecOps pipeline
+is complete.
+
+---
+
+## Phase 8.5 Status: Complete
+
+Pipeline confirmed passing on GitLab. Both validation jobs run correctly on the
+self-hosted macOS runner.
+
+**Next: Phase 8.6 — GitLeaks secret scanning**
+Pre-condition: `brew install gitleaks` on runner Mac.
