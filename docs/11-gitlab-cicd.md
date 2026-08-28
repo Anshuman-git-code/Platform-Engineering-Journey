@@ -495,3 +495,114 @@ self-hosted macOS runner.
 
 **Next: Phase 8.6 — GitLeaks secret scanning**
 Pre-condition: `brew install gitleaks` on runner Mac.
+
+---
+
+## Phase 8.6 — GitLeaks Secret Scanning
+
+### Engineering Problem
+
+A secret committed to application source code — an API key, database password, private key,
+or JWT signing secret — becomes part of the Docker image if it is present at build time.
+Even if the secret is removed in a later commit, it remains accessible in any image built
+from an earlier commit and in git history. The correct intervention point is before the
+image is built: scan application source on every push and fail the pipeline if a secret is
+detected.
+
+### False Positive Investigation
+
+Initial testing with `gitleaks detect --source ./client --exit-code 1` (with git history
+scanning) produced a detection:
+
+```
+File:  docs/02-local-environment-verification.md
+Match: token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+Rule:  generic-api-key
+```
+
+This is a JWT token example in engineering documentation — not a real secret. GitLeaks
+with git history traversal correctly identifies it as a token pattern, but the context
+(documentation) means it is not a true positive.
+
+**Engineering decision:** Scope the scan to application source directories only
+(`client/src` and `api`) using `--no-git` (filesystem scan, no history traversal). This
+scans exactly what will be compiled into Docker images while avoiding false positives from
+documentation that intentionally contains token examples.
+
+The trade-off: git history is not scanned by this stage. That is an accepted limitation for
+this project — the engineering documentation is the source of the false positives, and the
+business risk being mitigated is secrets in application source that would be embedded in
+container images.
+
+### Pipeline Architecture
+
+```
+git push → GitLab
+        │
+        ▼
+Stage: secret-scan (after validate)
+        └── gitleaks-scan
+              ├── gitleaks detect --source ./client/src --no-git --exit-code 1
+              └── gitleaks detect --source ./api --no-git --exit-code 1
+```
+
+### Why `--no-git`
+
+`gitleaks detect` without `--no-git` traverses git commit history. On this project, that
+produces false positives from documentation files containing JWT examples. `--no-git`
+scans the current filesystem content only — which is what will actually be included in the
+Docker build context and compiled into images.
+
+### Local Verification
+
+```bash
+gitleaks version
+# 8.30.1
+
+gitleaks detect --source ./client/src --no-git --exit-code 1
+# INF scanned ~29980 bytes (29.98 KB) in 320ms
+# INF no leaks found  (exit 0)
+
+gitleaks detect --source ./api --no-git --exit-code 1
+# INF scanned ~8318 bytes (8.32 KB) in 58.7ms
+# INF no leaks found  (exit 0)
+```
+
+### GitLab Pipeline Verification
+
+Pipeline `2800716629` on commit `beb60a5`. All 4 jobs on the runner confirmed:
+
+| Job ID | Job Name | Status | Duration |
+|---|---|---|---|
+| 16176989886 | runner-verification | success | 5.68s |
+| 16176989887 | validate-frontend | success | 4.69s |
+| 16176989888 | validate-backend | success | 3.67s |
+| 16176989889 | gitleaks-scan | success | 3.73s |
+
+Evidence from `gitlab-runner.err.log`:
+```
+job=16176989889 job-status=success   (gitleaks-scan)
+```
+
+### Production Considerations
+
+The current scan uses `--no-git` and scopes to `client/src` and `api`. A more comprehensive
+production approach would:
+1. Add a `.gitleaks.toml` configuration file to suppress known false positives selectively,
+   allowing `--source .` to scan the entire repository
+2. Use `gitleaks protect` as a pre-commit hook on developer machines as an earlier
+   detection layer
+3. Add a dedicated secrets baseline file to track reviewed false positives
+
+These improvements are deferred to a future pipeline hardening iteration.
+
+---
+
+## Phase 8.6 Status: Complete
+
+GitLeaks scanning confirmed passing on GitLab. Application source is free of detectable
+secrets. Pipeline now has 3 stages: `verify`, `validate`, `secret-scan`.
+
+**Next: Phase 8.7 — SonarQube Static Analysis**
+Pre-condition: SonarQube must be running locally and `SONAR_TOKEN` must be added as a
+masked GitLab CI variable.
