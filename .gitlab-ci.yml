@@ -1,6 +1,12 @@
 stages:
   - verify
+  - validate
 
+# ─────────────────────────────────────────────────────
+# Phase 8A — Runner Verification
+# Proves the self-hosted runner is reachable and has
+# access to Docker, kubectl, and Minikube.
+# ─────────────────────────────────────────────────────
 runner-verification:
   stage: verify
   tags:
@@ -11,4 +17,41 @@ runner-verification:
     - docker --version
     - kubectl version --client
     - minikube status
-    
+
+# ─────────────────────────────────────────────────────
+# Phase 8.5 — Validation / Compilation
+#
+# Engineering problem:
+#   A syntax error in application source code would cause
+#   docker build to succeed but the container to crash at
+#   startup. Catching this early (before any build) is
+#   cheap and fast — node --check parses JS without executing.
+#
+# Why node --check:
+#   - Requires only the Node.js binary (already on runner)
+#   - No npm install needed — no dependency on node_modules
+#   - Equivalent to the reference project's compilation stage
+#   - Exits non-zero on any syntax error, fails the pipeline
+#
+# What it does NOT check:
+#   - Runtime logic errors
+#   - Missing imports (those surface at build/run time)
+#   - React JSX (handled by react-scripts build)
+# ─────────────────────────────────────────────────────
+validate-frontend:
+  stage: validate
+  tags:
+    - macos
+  script:
+    - echo "Validating frontend JavaScript syntax..."
+    - find client/src -name "*.js" -not -path "*/node_modules/*" -exec node --check {} +
+    - echo "Frontend validation passed."
+
+validate-backend:
+  stage: validate
+  tags:
+    - macos
+  script:
+    - echo "Validating backend JavaScript syntax..."
+    - find api -name "*.js" -not -path "*/node_modules/*" -exec node --check {} +
+    - echo "Backend validation passed."

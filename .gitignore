@@ -23,3 +23,6 @@ client/build/
 
 # Internal AI workflow state
 docs/internal/
+
+# Kiro workspace configuration (local only)
+.kiro/
