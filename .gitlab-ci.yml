@@ -2,6 +2,7 @@ stages:
   - verify
   - validate
   - secret-scan
+  - code-quality
 
 # ─────────────────────────────────────────────────────
 # Phase 8A — Runner Verification
@@ -93,3 +94,44 @@ gitleaks-scan:
     - echo "Scanning backend source for secrets..."
     - gitleaks detect --source ./api --no-git --exit-code 1
     - echo "GitLeaks scan passed — no secrets detected in application source."
+
+# ─────────────────────────────────────────────────────
+# Phase 8.7 — SonarCloud Static Analysis
+#
+# Engineering problem:
+#   Syntax validation (Phase 8.5) checks that code
+#   can be parsed. It does not check code quality,
+#   security hotspots, duplication, complexity, or
+#   known vulnerability patterns. SonarCloud performs
+#   deep static analysis and produces a quality report
+#   visible in the SonarCloud dashboard.
+#
+# Architecture:
+#   sonar-scanner (CLI on runner Mac)
+#     → reads source code (api/, client/src/)
+#     → sends analysis to https://sonarcloud.io
+#     → SonarCloud stores results + evaluates Quality Gate
+#
+# Why SonarCloud instead of local SonarQube:
+#   SonarQube community edition running in Docker via
+#   Colima crashed repeatedly due to Colima VM memory
+#   constraints (2GiB insufficient for ElasticSearch).
+#   SonarCloud is the cloud-hosted equivalent — same
+#   analysis engine, no local infrastructure required.
+#
+# sonar-project.properties at repo root contains:
+#   projectKey, organization, sources, exclusions.
+#
+# SONAR_TOKEN is stored as a masked GitLab CI variable.
+# It is never written in this file.
+# ─────────────────────────────────────────────────────
+sonarcloud-analysis:
+  stage: code-quality
+  tags:
+    - macos
+  script:
+    - echo "Running SonarCloud static analysis..."
+    - sonar-scanner
+      -Dsonar.host.url=https://sonarcloud.io
+      -Dsonar.token=$SONAR_TOKEN
+    - echo "SonarCloud analysis submitted successfully."
