@@ -129,7 +129,9 @@ sonarcloud-analysis:
   stage: code-quality
   tags:
     - macos
+  variables:
+    SONAR_HOST_URL: "https://sonarcloud.io"
   script:
     - echo "Running SonarCloud static analysis..."
-    - sonar-scanner -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.token=$SONAR_TOKEN
+    - sonar-scanner -Dsonar.host.url=https://sonarcloud.io -Dsonar.token=$SONAR_TOKEN
     - echo "SonarCloud analysis submitted successfully."
