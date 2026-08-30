@@ -133,5 +133,6 @@ sonarcloud-analysis:
     SONAR_HOST_URL: "https://sonarcloud.io"
   script:
     - echo "Running SonarCloud static analysis..."
-    - sonar-scanner -Dsonar.host.url=https://sonarcloud.io -Dsonar.token=$SONAR_TOKEN
+    - echo "Token length (debug):" ${#SONAR_TOKEN}
+    - sonar-scanner -Dsonar.host.url=https://sonarcloud.io -Dsonar.token=$SONAR_TOKEN -Dsonar.scanner.skipJreProvisioning=true
     - echo "SonarCloud analysis submitted successfully."
