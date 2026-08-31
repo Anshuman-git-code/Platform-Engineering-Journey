@@ -606,3 +606,224 @@ secrets. Pipeline now has 3 stages: `verify`, `validate`, `secret-scan`.
 **Next: Phase 8.7 — SonarQube Static Analysis**
 Pre-condition: SonarQube must be running locally and `SONAR_TOKEN` must be added as a
 masked GitLab CI variable.
+
+---
+
+## Phase 8.7 — SonarCloud Static Analysis
+
+### Engineering Problem
+
+`node --check` (Phase 8.5) validates that JavaScript can be parsed. It does not detect:
+- Code quality issues (high complexity, duplicated logic)
+- Security hotspots (SQL injection patterns, hardcoded credentials, unsafe APIs)
+- Code smells (long methods, magic numbers, dead code)
+- Known vulnerability patterns
+
+SonarQube/SonarCloud performs deep static analysis across all of these dimensions and
+produces a persistent quality report with a Quality Gate decision — a pass/fail verdict
+against a defined quality standard. This is the DevSecOps gate between validation and
+image build.
+
+### SonarQube vs SonarCloud — Architecture Decision
+
+The original plan was to run SonarQube Community Edition locally in Docker via Colima.
+This failed due to a resource constraint:
+
+**V1 State — SonarQube crashed repeatedly**
+
+SonarQube embeds ElasticSearch as its search/indexing engine. ElasticSearch requires
+significant memory to initialize and run. Colima's default VM was allocated 2GiB RAM —
+insufficient for running SonarQube alongside other containers.
+
+```
+docker logs sonarqube
+# ...
+# 2026.08.28 19:41:08 WARN  Process exited with exit value [ElasticSearch]: 143
+# 2026.08.28 19:41:08 INFO  SonarQube is stopped
+```
+
+Exit 143 = SIGTERM — the container's OOM handler or Colima's memory pressure killed
+ElasticSearch.
+
+**V2 Fix — SonarCloud (cloud-hosted)**
+
+SonarCloud is the cloud-hosted equivalent of SonarQube. Same analysis engine, same rules,
+same Quality Gate model. No local infrastructure required. Free for public repositories.
+
+**Engineering tradeoff:** SonarCloud requires outbound network access from the runner to
+`sonarcloud.io`. The token is stored as a masked GitLab CI variable. Analysis results
+are stored in SonarCloud rather than locally, which is acceptable for this project.
+
+### Pipeline Architecture
+
+```
+git push → GitLab
+        │
+        ▼
+Stage: code-quality (after secret-scan)
+        └── sonarcloud-analysis
+              sonar-scanner
+                -Dsonar.host.url=https://sonarcloud.io
+                -Dsonar.token=$SONAR_TOKEN
+              (reads sonar-project.properties from repo root)
+```
+
+### sonar-project.properties
+
+```properties
+sonar.projectKey=platform-engineering-journey
+sonar.organization=platform-engineering-journey
+sonar.projectName=Platform Engineering Journey
+sonar.sources=api,client/src
+sonar.exclusions=**/node_modules/**,client/build/**,client/public/**
+sonar.sourceEncoding=UTF-8
+```
+
+`sonar.sources` scopes analysis to `api/` (backend) and `client/src/` (frontend).
+`sonar.exclusions` prevents vendored dependencies and build output from inflating metrics.
+
+### Debugging Log — Three Real Failures
+
+This phase produced three distinct failure modes, each at a different layer.
+
+---
+
+**Failure 1 — `minikube status` exit code 7 blocking all pipeline stages**
+
+**Symptom:** Every pipeline failed in the `runner-verification` job with `exit status 7`.
+The sonarcloud-analysis job never executed.
+
+**Evidence from GitLab CI job log:**
+```
+$ minikube status
+minikube
+type: Control Plane
+host: Stopped
+kubelet: Stopped
+apiserver: Stopped
+kubeconfig: Stopped
+
+ERROR: Job failed: exit status 7
+```
+
+**Root cause:** `minikube status` exits with code 7 when the cluster is in a stopped
+state. This is a documented minikube behavior. The runner's shell exits with this code,
+which GitLab CI interprets as a script failure and marks the job failed.
+
+**Affected layer:** CI/CD configuration — the `runner-verification` job did not handle
+expected non-zero exit codes from status commands.
+
+**Fix:** Added `|| true` to the `minikube status` line:
+```yaml
+- minikube status || true
+```
+
+This makes the command always exit 0 regardless of minikube's state. The status output
+is still printed for observability — only the exit code behavior changes.
+
+**Verification:** Pipeline `2805302878` — `runner-verification` passed successfully.
+
+**Engineering lesson:** Status-checking commands in CI pipelines must be designed to
+report information without failing the pipeline when the subject is in an expected
+non-running state. A stopped minikube cluster during a source validation stage is not
+a failure condition.
+
+---
+
+**Failure 2 — YAML multi-line continuation did not expand shell variables**
+
+**Symptom:** SonarCloud analysis failed with `URI with undefined scheme`. The URL
+`$SONAR_HOST_URL` was not being resolved.
+
+**Evidence:**
+```
+ERROR Failed to query server version: URI with undefined scheme
+```
+
+**Root cause:** The pipeline used YAML multi-line continuation for the `sonar-scanner`
+command:
+```yaml
+- sonar-scanner
+  -Dsonar.host.url=$SONAR_HOST_URL
+  -Dsonar.token=$SONAR_TOKEN
+```
+
+In GitLab CI YAML, continuation lines after a `- ` list item are string continuations,
+not shell argument continuations. The result was that `-Dsonar.host.url=$SONAR_HOST_URL`
+was treated as a separate string, with the variable not expanding as expected by the
+shell.
+
+**Fix:** Single-line command:
+```yaml
+- sonar-scanner -Dsonar.host.url=https://sonarcloud.io -Dsonar.token=$SONAR_TOKEN
+```
+
+**Engineering lesson:** In GitLab CI YAML `script:` blocks, each list item is a
+complete shell command. Multi-line shell argument passing requires explicit line
+continuation characters (`\`) within the string, not YAML indentation.
+
+---
+
+**Failure 3 — SONAR_TOKEN variable contained old local SonarQube token**
+
+**Symptom:** `sonar-scanner` reached SonarCloud successfully but received HTTP 403.
+
+**Evidence:**
+```
+INFO  Communicating with SonarQube Cloud
+ERROR Failed to query JRE metadata: HTTP 403 Forbidden.
+      Please check the property sonar.token or the environment variable SONAR_TOKEN.
+```
+
+**Root cause:** The `SONAR_TOKEN` GitLab CI variable was initially set with the token
+generated for the local SonarQube instance. When the project migrated to SonarCloud,
+the variable was updated but the new token was either incorrect or generated before the
+SonarCloud project was fully set up.
+
+**Fix:** Regenerated the SonarCloud project analysis token, updated `SONAR_TOKEN` in
+GitLab CI variables with the new value.
+
+**Engineering lesson:** CI credentials and the services they authorize must be
+rotated together. Changing the analysis target (local SonarQube → SonarCloud) requires
+generating a new token from the new service and updating all consumers simultaneously.
+
+---
+
+### Successful Verification
+
+Pipeline `2805302878` on commit `6643ab2`. All jobs passed:
+
+| Job ID | Job Name | Status | Duration |
+|---|---|---|---|
+| 16203390216 | runner-verification | success | 5.13s |
+| 16203390217 | sonarcloud-analysis | success | 11.88s |
+| 16203390218 | validate-frontend | success | 3.87s |
+| 16203390219 | validate-backend / gitleaks | success | 4.67s |
+
+The `sonarcloud-analysis` job took 11.88 seconds — significantly longer than the other
+jobs — confirming that sonar-scanner actually connected to SonarCloud, uploaded the
+analysis, and received a response.
+
+Analysis results are visible at:
+`https://sonarcloud.io` → Organization: `Platform-Engineering-Journey`
+
+### Production Considerations
+
+The current SonarCloud setup uses the Free plan on a public repository. In production:
+
+- **Quality Gate** must be enforced (Phase 8.8 — next step): the pipeline should fail
+  if the Quality Gate status is not `OK`.
+- **Branch analysis** should be configured so every feature branch is analysed and
+  results are shown in merge requests.
+- **SonarCloud GitHub/GitLab integration** can display inline issue comments on merge
+  requests automatically.
+
+---
+
+## Phase 8.7 Status: Complete
+
+SonarCloud analysis confirmed running on GitLab pipeline `2805302878`. All three
+debugging failures documented and resolved. Analysis results visible in SonarCloud.
+
+**Current pipeline stages:** verify → validate → secret-scan → code-quality
+**Next: Phase 8.8 — Quality Gate enforcement**

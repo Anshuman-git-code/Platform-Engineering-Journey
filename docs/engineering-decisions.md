@@ -855,3 +855,73 @@ gitlab   → GitLab (CI/CD platform)
 
 Each push to `gitlab main` triggers the pipeline. Pushes to `origin main` update the
 public documentation.
+
+---
+
+## Phase 8 — GitLab CI/CD Decisions (continued)
+
+## Decision 33 — Use SonarCloud instead of self-hosted SonarQube
+
+### Context
+
+Phase 8.7 planned to run SonarQube Community Edition locally via Docker under Colima.
+SonarQube's embedded ElasticSearch process crashed repeatedly with SIGTERM (exit 143)
+because Colima's default 2GiB VM allocation was insufficient.
+
+### Decision
+
+Use SonarCloud (cloud-hosted at sonarcloud.io) instead of a local SonarQube instance.
+
+### Reasoning
+
+SonarCloud uses the same analysis engine as SonarQube. For public repositories on the
+Free plan, it provides identical analysis capabilities with no infrastructure to manage.
+The runner requires only outbound HTTPS to sonarcloud.io, which is available. The
+`SONAR_TOKEN` is stored as a masked GitLab CI variable — no credential exposure.
+
+Increasing Colima VM memory to 4GiB would have been the alternative, but would have
+stopped all running containers on the Mac temporarily and added ongoing resource pressure.
+
+### Tradeoff
+
+Analysis results are stored on SonarCloud's servers rather than locally. This is
+acceptable for a portfolio project on a public repository. Production environments with
+data residency requirements would use a self-hosted SonarQube with adequate memory.
+
+### Result
+
+SonarCloud analysis confirmed working on pipeline `2805302878`. Analysis visible at
+sonarcloud.io for organization `Platform-Engineering-Journey`.
+
+---
+
+## Decision 34 — Add `|| true` to minikube status in runner-verification
+
+### Context
+
+`minikube status` exits with code 7 when the cluster is stopped. This exit code caused
+the `runner-verification` job to fail, blocking the entire pipeline before any
+meaningful stage could run.
+
+### Decision
+
+Append `|| true` to the `minikube status` command in the pipeline:
+```yaml
+- minikube status || true
+```
+
+### Reasoning
+
+The `runner-verification` job's purpose is to confirm the runner has access to required
+tools — it is a diagnostic/informational job. A stopped minikube cluster is an expected
+state between development sessions and does not indicate a problem with the runner or
+the pipeline.
+
+Making the job fail when minikube is stopped prevents all subsequent stages (validation,
+security scanning, SonarCloud analysis) from running — which is counterproductive. The
+minikube status output is still printed for observability.
+
+### Result
+
+Pipeline stages now proceed regardless of minikube state. Minikube only needs to be
+running for the Kubernetes deployment stage (Phase 8.14).

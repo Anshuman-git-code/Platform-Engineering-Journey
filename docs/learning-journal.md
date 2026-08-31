@@ -1014,3 +1014,68 @@ Kubernetes deployment — are the same regardless of platform. The skills transf
 
 Runner is operational, Docker and kubectl are accessible, first pipeline succeeded.
 Phase 8B begins the real DevSecOps pipeline: compilation verification and GitLeaks.
+
+---
+
+## Phase 8 — GitLab CI/CD (continued)
+
+### On Exit Codes as the Real Language of CI/CD
+
+The minikube bug was the most instructive failure in Phase 8 so far. The pipeline
+consistently failed with exit status 7 across every push. The temptation was to assume
+the sonarcloud-analysis job was failing — but the job log showed the failure happened in
+`runner-verification`, before sonarcloud-analysis ever ran.
+
+Exit code 7 is the story: `minikube status` returns 7 when the cluster is stopped. That
+is not an error in the traditional sense — it is a status code. But CI/CD pipelines
+treat any non-zero exit from a script command as a failure. The fix was one word: `true`.
+
+This revealed an important distinction between interactive shell usage and CI/CD shell
+usage. In an interactive terminal, `minikube status` returning exit 7 with a status
+report is useful information. In a CI/CD pipeline, it is a job failure that blocks
+every downstream stage. Status-checking commands in pipelines need explicit exit code
+handling.
+
+---
+
+### On YAML Multi-Line Continuation Not Being Shell Multi-Line
+
+The variable expansion failure (`URI with undefined scheme`) was a YAML-to-shell
+translation problem. Writing:
+```yaml
+- sonar-scanner
+  -Dsonar.host.url=$SONAR_HOST_URL
+```
+looks like shell argument continuation. It is not. In GitLab CI YAML, each `- ` item
+is an independent shell command. The continuation lines are string continuations in
+YAML, not shell argument passing.
+
+Shell multi-line commands in CI YAML require explicit `\` continuation:
+```yaml
+- sonar-scanner \
+  -Dsonar.host.url=$SONAR_HOST_URL
+```
+Or, more simply, a single line. The lesson: YAML and shell have different multi-line
+semantics, and they do not compose transparently.
+
+---
+
+### On the Value of Reading Actual Error Output
+
+All three Phase 8.7 failures were diagnosed from actual error messages, not guesses:
+
+- "exit status 7" → `minikube status` exit code → `|| true` fix
+- "URI with undefined scheme" → variable not expanding → single-line fix
+- "HTTP 403 Forbidden" → wrong token → token rotation fix
+
+Each error message contained the exact failure layer. None required random changes or
+repeated retries without understanding. The engineering discipline of reading the actual
+output before changing anything made every fix targeted and correct.
+
+---
+
+## Phase 8 — Status: 8.7 Complete, 8.8 Next
+
+SonarCloud analysis is running. The pipeline has 4 stages with 5 jobs, all passing.
+Phase 8.8 adds Quality Gate enforcement — making the pipeline fail if code quality
+falls below the defined threshold.
