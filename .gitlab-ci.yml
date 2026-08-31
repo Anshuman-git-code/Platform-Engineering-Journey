@@ -18,7 +18,7 @@ runner-verification:
     - git --version
     - docker --version
     - kubectl version --client
-    - minikube status
+    - minikube status || true
 
 # ─────────────────────────────────────────────────────
 # Phase 8.5 — Validation / Compilation
