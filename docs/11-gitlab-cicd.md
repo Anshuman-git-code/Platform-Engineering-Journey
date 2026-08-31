@@ -827,3 +827,103 @@ debugging failures documented and resolved. Analysis results visible in SonarClo
 
 **Current pipeline stages:** verify → validate → secret-scan → code-quality
 **Next: Phase 8.8 — Quality Gate enforcement**
+
+---
+
+## Phase 8.8 — Quality Gate Enforcement
+
+### Engineering Problem
+
+Phase 8.7 runs SonarCloud static analysis and submits results. Without enforcement,
+analysis is purely informational — bad code with security hotspots, critical bugs, or
+coverage failures can still proceed to Docker image build and deployment.
+
+The Quality Gate is SonarCloud's pass/fail verdict against a defined quality standard.
+Enforcing it in the pipeline means: if code does not meet the standard, the build stops.
+This is the actual security and quality control mechanism — Phase 8.7 without Phase 8.8
+is observation without action.
+
+### Implementation
+
+One addition to `sonar-project.properties`:
+
+```properties
+sonar.qualitygate.wait=true
+sonar.qualitygate.timeout=300
+```
+
+**`sonar.qualitygate.wait=true`** — instructs sonar-scanner to poll SonarCloud after
+submitting the analysis, waiting for the Quality Gate computation to complete. If the
+gate status is `ERROR` or `NONE`, sonar-scanner exits with a non-zero code, which fails
+the GitLab CI job and stops all downstream stages.
+
+**`sonar.qualitygate.timeout=300`** — maximum seconds to wait for the Quality Gate
+result before timing out (5 minutes). SonarCloud analysis computation typically takes
+1–5 minutes for a project of this size.
+
+No changes were required to `.gitlab-ci.yml` — the enforcement integrates directly into
+the existing `sonarcloud-analysis` job.
+
+### Pipeline Architecture
+
+```
+sonarcloud-analysis job:
+    sonar-scanner submits analysis
+        │
+        ▼
+    sonar-scanner polls SonarCloud API
+    GET /api/qualitygates/project_status?projectKey=...
+        │
+        │  (waits up to 300 seconds)
+        │
+        ▼
+    Quality Gate status returned: OK / ERROR / NONE
+        │
+        ├── OK → sonar-scanner exits 0 → job succeeds → pipeline continues
+        └── ERROR/NONE → sonar-scanner exits non-zero → job fails → pipeline stops
+```
+
+### Verification
+
+Pipeline `2805363348` on commit `c2c31f0`. All 5 jobs passed:
+
+| Job ID | Job Name | Status | Duration |
+|---|---|---|---|
+| 16203844139 | runner-verification | success | 5.79s |
+| 16203844140 | validate-frontend | success | 4.88s |
+| 16203844141 | validate-backend | success | 5.07s |
+| 16203844142 | gitleaks-scan | success | 5.31s |
+| 16203844143 | sonarcloud-analysis (with QG) | success | 267.48s |
+
+The `sonarcloud-analysis` job took **267 seconds** — compared to ~12 seconds without
+Quality Gate wait. The difference is sonar-scanner polling SonarCloud for the gate
+result. A 267-second wait confirms SonarCloud processed the full analysis and returned
+`OK`.
+
+**Quality Gate passed** — the current codebase meets SonarCloud's default quality
+standard.
+
+### Production Considerations
+
+The current Quality Gate is SonarCloud's default `Sonar way` gate. In production,
+a custom Quality Gate would define project-specific thresholds:
+
+- Maximum new critical/blocker issues: 0
+- Minimum coverage on new code: 80%
+- Maximum duplicated lines on new code: 3%
+- Security Rating on new code: A
+
+The `sonar.qualitygate.timeout=300` (5 minutes) is conservative for this project size.
+For larger projects, this may need to increase to avoid false timeout failures.
+
+---
+
+## Phase 8.8 Status: Complete
+
+Quality Gate enforcement confirmed working on pipeline `2805363348`. The
+`sonarcloud-analysis` job now waits for the Quality Gate result and will fail the
+pipeline if code quality falls below the defined standard.
+
+**Current pipeline stages:** verify → validate → secret-scan → code-quality
+**Pipeline: 5 jobs, all passing**
+**Next: Phase 8.9 — Trivy Filesystem Scan**
