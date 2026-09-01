@@ -1672,3 +1672,367 @@ verify → validate → secret-scan → code-quality → security-scan → build
 ```
 
 **Next: Phase 8.14 — Kubernetes Deployment to Minikube**
+
+---
+
+## Phase 8.14 — Kubernetes Deployment to Minikube
+
+### Engineering Problem
+
+Images are on Docker Hub. The Kubernetes cluster must pull the new images and perform
+a rolling update. This is the final stage of the DevSecOps loop:
+
+```
+git push → validate → secret scan → static analysis → vuln scan
+         → docker build → image scan → push to registry → deploy to cluster
+```
+
+Without this stage, the pipeline builds and validates code but never deploys it.
+The deployment stage proves the full loop works: a code change on `main` can
+automatically produce a running application update in the cluster.
+
+### Architecture — Rolling Update
+
+```
+kubectl set image deployment/backend backend=anshuman04/backend:$SHA -n prod
+                │
+                ▼
+    Kubernetes creates new ReplicaSet with new image
+                │
+                ├── Schedules new pod (pulls from Docker Hub)
+                ├── Waits for new pod Ready
+                ├── Terminates old pod
+                └── Repeats until all replicas updated
+
+kubectl rollout status deployment/backend -n prod --timeout=120s
+                │
+                └── Blocks CI job until rollout complete or timeout
+```
+
+The `kubectl rollout status` command holds the CI job open while Kubernetes performs
+the rolling update. If any pod fails to start (ImagePullBackOff, CrashLoopBackOff),
+the command times out and fails the pipeline — preventing a broken deployment from
+being marked as successful.
+
+### Why `kubectl set image` Instead of `kubectl apply`
+
+The deployment manifests in `Kubernetes/` originally referenced local images
+(`backend:v2`, `frontend:v4`) that existed only in Minikube's Docker context from
+Phase 7. Applying those manifests directly would revert the cluster to those old
+local images.
+
+`kubectl set image` updates only the image field of the running deployment — all
+other configuration (env vars, secrets, resource limits, service accounts) remains
+unchanged. This is the correct approach for image-only updates in a CI/CD pipeline.
+
+The manifests were updated in commit `c4ea434` to reference Docker Hub images
+(`anshuman04/backend:latest`, `anshuman04/frontend:latest`) with `imagePullPolicy: Always`
+for future `kubectl apply`-based deployments.
+
+### Pre-conditions
+
+- Minikube cluster running (`minikube start`)
+- `prod` namespace exists (`kubectl get namespace prod`)
+- All deployments exist in `prod` namespace
+- Images pushed to Docker Hub for the current commit SHA
+
+### Debugging Log — Three Real Failures
+
+This phase produced three distinct failure modes before the deployment succeeded.
+
+---
+
+#### Failure 1 — etcd write timeouts (persistent, blocking all writes)
+
+**Symptom:** `kubectl set image` failed immediately with:
+
+```
+error: failed to patch image update to pod template: etcdserver: request timed out
+```
+
+**Diagnosis commands run:**
+
+```bash
+# Check etcd pod health
+kubectl get componentstatuses
+
+# Output:
+NAME                 STATUS    MESSAGE   ERROR
+scheduler            Healthy   ok
+controller-manager   Healthy   ok
+etcd-0               Healthy   ok
+
+# Check etcd logs for actual errors
+kubectl logs etcd-minikube -n kube-system --tail=20
+```
+
+**Evidence from etcd logs:**
+```
+"msg":"request stats","start time":"2026-09-01T04:50:05Z",
+"time spent":"7.000760754s","response type":"/etcdserverpb.KV/Txn",
+"request count":0,"request size":0
+
+"msg":"failed to revoke lease","lease-id":"70cc9ff09e742c70",
+"error":"etcdserver: request timed out"
+```
+
+Every KV write timing out at exactly 7 seconds. The same two lease IDs
+(`70cc9ff09e742c70`, `70cc9ff09e742ca0`) appeared repeatedly — stale leases from a
+previous ungraceful shutdown that etcd was stuck trying to revoke.
+
+**Root cause:** etcd data directory corrupted from previous session where Minikube was
+stopped without a clean shutdown. Colima had only 2GB RAM — insufficient for Minikube
++ etcd + application containers.
+
+**Fix — two steps:**
+
+Step 1: Increase Colima memory to 6GB:
+```bash
+minikube stop
+colima stop
+colima start --cpu 2 --memory 6
+```
+
+Step 2: Delete and recreate Minikube cluster (etcd data was corrupted, restart alone
+was insufficient):
+```bash
+minikube stop
+minikube delete
+minikube start --driver=docker
+
+# Verify etcd writes work before proceeding:
+kubectl get nodes
+kubectl create namespace prod
+# If these work → etcd is healthy
+```
+
+**Verification:**
+```bash
+$ kubectl set image deployment/backend backend=anshuman04/backend:f241ec13 -n prod --dry-run=server
+deployment.apps/backend image updated (server dry run)
+# ✅ dry-run succeeded → etcd writes working
+```
+
+---
+
+#### Failure 2 — `manifest unknown` — wrong image tag format
+
+**Symptom:** After etcd was fixed, pods entered `ErrImagePull`:
+
+```bash
+$ kubectl get pods -n prod
+NAME                    STATUS             RESTARTS
+backend-996d55c67-q85hj 0/1   ImagePullBackOff   0
+
+$ kubectl describe pod backend-996d55c67-q85hj -n prod | grep -A8 "Events:"
+Warning  Failed  kubelet  Failed to pull image "anshuman04/backend:666317c":
+Error response from daemon: manifest for anshuman04/backend:666317c not found:
+manifest unknown: manifest unknown
+```
+
+**Root cause:** In manual testing, `git log --oneline` outputs 7-character abbreviated
+SHAs. `$CI_COMMIT_SHORT_SHA` in GitLab CI expands to **8 characters**. The push job
+had tagged images as `anshuman04/backend:f241ec13` (8 chars), but manual `kubectl set image`
+used `f241ec1` (7 chars) — a non-existent tag on Docker Hub.
+
+**Diagnosis commands:**
+```bash
+# Check what image tags actually exist locally
+docker images | grep backend
+
+# Output shows:
+anshuman04/backend:f241ec13    655d4960c57b    248MB
+anshuman04/backend:latest      655d4960c57b    248MB
+# Note: 8-char SHA, not 7-char
+```
+
+**Fix:**
+```bash
+kubectl set image deployment/backend backend=anshuman04/backend:f241ec13 -n prod
+# Use 8-char SHA matching Docker Hub tag
+```
+
+**Engineering lesson:** Always check actual tag names via `docker images` before
+constructing manual `kubectl set image` commands. `git log --oneline` SHA length differs
+from `$CI_COMMIT_SHORT_SHA`.
+
+---
+
+#### Failure 3 — Rollout timeout during image pull
+
+**Symptom:** `kubectl rollout status` timed out while pods were in `ImagePullBackOff`.
+
+**Diagnosis commands:**
+```bash
+# Check pod status
+kubectl get pods -n prod
+
+# Get specific pod events
+kubectl describe pod <pod-name> -n prod | grep -A8 "Events:"
+
+# Watch rollout in real-time
+kubectl rollout status deployment/backend -n prod --timeout=180s
+
+# Check if image exists on Docker Hub (unauthenticated — works for public repos)
+curl -s "https://hub.docker.com/v2/repositories/anshuman04/backend/tags/" | python3 -m json.tool
+```
+
+**Root cause:** First attempt used wrong commit SHA (`666317c7` which was not pushed to
+Docker Hub — only `f241ec13` was pushed). After correcting to `f241ec13`, the rollout
+completed successfully.
+
+---
+
+### Successful Pipeline Execution — Job on Commit `c4ea434d`
+
+**Full verified job output:**
+
+```
+$ echo "Deploying to Minikube..."
+Deploying to Minikube...
+
+$ minikube status
+minikube
+type: Control Plane
+host: Running
+kubelet: Running
+apiserver: Running
+kubeconfig: Configured
+
+$ kubectl config use-context minikube
+Switched to context "minikube".
+
+$ kubectl set image deployment/backend backend=[MASKED]/backend:c4ea434d -n prod
+deployment.apps/backend image updated
+
+$ kubectl set image deployment/frontend frontend=[MASKED]/frontend:c4ea434d -n prod
+deployment.apps/frontend image updated
+
+$ kubectl rollout status deployment/backend -n prod --timeout=120s
+Waiting for deployment "backend" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "backend" rollout to finish: 1 old replicas are pending termination...
+deployment "backend" successfully rolled out
+
+$ kubectl rollout status deployment/frontend -n prod --timeout=120s
+Waiting for deployment "frontend" rollout to finish: 1 out of 3 new replicas have been updated...
+Waiting for deployment "frontend" rollout to finish: 2 out of 3 new replicas have been updated...
+Waiting for deployment "frontend" rollout to finish: 1 old replicas are pending termination...
+deployment "frontend" successfully rolled out
+
+$ kubectl get pods -n prod
+NAME                        READY   STATUS        RESTARTS   AGE
+backend-74cd6bcdd-knt25     1/1     Terminating   0          16m   ← old pod terminating
+backend-795888bc47-gfv28    1/1     Running       0          16s   ← new pod with c4ea434d
+frontend-6b86db8676-csxhl   1/1     Running       0          16s
+frontend-6b86db8676-l9p6j   1/1     Running       0          4s
+frontend-6b86db8676-r6bjn   1/1     Running       0          7s
+frontend-7f8cd65557-85jlp   1/1     Terminating   0          15m   ← old pod terminating
+mysql-6686999677-7vhhx      1/1     Running       0          27m   ← unchanged
+
+$ kubectl get services -n prod
+NAME       TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)
+backend    NodePort    10.96.237.178    <none>        5000:31973/TCP
+frontend   NodePort    10.100.228.149   <none>        80:30174/TCP
+mysql      ClusterIP   10.97.91.106     <none>        3306/TCP
+
+Job succeeded
+```
+
+### Debugging Reference — Commands Used During This Phase
+
+These are the exact commands that were used to diagnose and fix issues. Keep these
+for reference during future Kubernetes debugging sessions.
+
+**Cluster health:**
+```bash
+kubectl get nodes                          # cluster reachable?
+kubectl get componentstatuses              # etcd, scheduler, controller healthy?
+kubectl get pods -n kube-system            # system pods running?
+kubectl logs etcd-minikube -n kube-system --tail=20   # etcd internal errors
+```
+
+**Pod diagnosis:**
+```bash
+kubectl get pods -n prod                   # pod status overview
+kubectl describe pod <name> -n prod        # full event log, image pull errors
+kubectl describe pod <name> -n prod | grep -A8 "Events:"   # just events
+kubectl logs <pod-name> -n prod            # application logs
+kubectl logs <pod-name> -n prod --previous # logs from crashed previous instance
+```
+
+**Deployment and rollout:**
+```bash
+kubectl get deployments -n prod            # replica counts
+kubectl rollout status deployment/<name> -n prod --timeout=120s
+kubectl rollout history deployment/<name> -n prod   # revision history
+kubectl rollout undo deployment/<name> -n prod       # rollback to previous
+kubectl set image deployment/<name> <container>=<image>:<tag> -n prod
+kubectl set image deployment/backend backend=anshuman04/backend:f241ec13 -n prod
+```
+
+**Image and registry:**
+```bash
+docker images | grep backend               # local image tags (check SHA length)
+docker images | grep frontend
+trivy image anshuman04/backend:latest      # scan pushed image
+```
+
+**Colima / Minikube resource management:**
+```bash
+colima list                                # memory, CPU allocation
+colima stop
+colima start --cpu 2 --memory 6            # restart with more memory
+minikube stop
+minikube delete                            # full cluster wipe (fixes etcd corruption)
+minikube start --driver=docker
+minikube status
+kubectl config use-context minikube        # ensure correct context
+```
+
+**Wait for resources:**
+```bash
+kubectl wait --namespace ingress-nginx \
+  --for=condition=ready pod \
+  --selector=app.kubernetes.io/component=controller \
+  --timeout=90s                            # wait for ingress controller
+kubectl rollout status deployment/<name> -n prod --timeout=180s
+```
+
+### Complete Failure Journey — Summary Table
+
+| Attempt | Failure | Diagnosis Command | Root Cause | Fix |
+|---|---|---|---|---|
+| 1 | etcd write timeouts on every kubectl write | `kubectl logs etcd-minikube -n kube-system` | Corrupted etcd data + 2GB Colima memory insufficient | `colima start --memory 6` + `minikube delete` + fresh `minikube start` |
+| 2 | `manifest unknown` — image not on Docker Hub | `docker images \| grep backend` | 7-char SHA used manually; Docker Hub tag is 8-char (`$CI_COMMIT_SHORT_SHA`) | Used correct 8-char SHA `f241ec13` |
+| 3 | Rollout timeout — wrong commit SHA pushed | `kubectl describe pod <name> -n prod` | Deploy job used `c4ea434d` SHA but only `f241ec13` was pushed to Docker Hub | Triggered push-images job for current commit, then retried deploy |
+
+### Production Considerations
+
+The current setup deploys to Minikube (local cluster). Production deployment to
+AWS EKS (Phase 12) will use the same `kubectl set image` pattern but with:
+
+- AWS EKS cluster context instead of minikube
+- `kubectl` configured with EKS credentials via `aws eks update-kubeconfig`
+- Images pulled from Docker Hub (or ECR for private registries)
+- Rolling update strategy with proper `minReadySeconds` and `progressDeadlineSeconds`
+- Post-deploy health checks via `kubectl wait` on pod conditions
+
+The Kubernetes manifest updates (`imagePullPolicy: Always`, Docker Hub image references)
+committed in `c4ea434` are the correct long-term configuration. Future `kubectl apply`
+runs will reference the correct registry and always pull fresh images.
+
+---
+
+## Phase 8.14 Status: Complete
+
+Pipeline-driven Kubernetes deployment confirmed working on job commit `c4ea434d`.
+Rolling update completed successfully — backend (1 replica) and frontend (3 replicas)
+updated to Docker Hub images without downtime. All 5 pods running in `prod` namespace.
+
+**Full pipeline now operational:**
+```
+verify → validate → secret-scan → code-quality → security-scan
+       → build → image-scan (manual) → push (manual) → deploy (manual)
+```
+
+**Next: Phase 8.15 — Rollout Verification (end-to-end application test post-deploy)**
