@@ -1025,3 +1025,126 @@ rather than scoping around them.
 ### Result
 
 Secret scanning passes cleanly on every pipeline run with no false positives.
+
+---
+
+## Decision 37 — Use `when: manual` for image-scan, push, and deploy stages
+
+### Context
+
+As the pipeline grew beyond 6 stages, every push triggered the full pipeline including
+Docker builds (~2 min), SonarCloud analysis (~3 min), and Trivy scans. When debugging
+new stages (image-scan, push, deploy), each iteration required waiting for all previous
+stages to complete before reaching the stage under test.
+
+### Decision
+
+Add `when: manual` to `trivy-image-scan-backend`, `trivy-image-scan-frontend`,
+`push-images`, and `deploy-to-minikube`. These stages run only when explicitly
+triggered via the GitLab UI play button.
+
+### Reasoning
+
+The automatic stages (verify through build) run on every push and catch regressions in
+source code, secrets, quality, and image builds. The manual stages involve external
+systems (Docker Hub, Minikube) that require intentional operator action. Making them
+manual matches the operational reality: you don't push to a registry or deploy to a
+cluster on every commit — you do so deliberately.
+
+### Result
+
+Automated stages run in ~5 minutes per push. Manual stages are triggered on demand,
+allowing iteration on new stages without waiting for the full pipeline.
+
+---
+
+## Decision 38 — Update K8s manifests to Docker Hub images with `imagePullPolicy: Always`
+
+### Context
+
+After Phase 7, the Kubernetes manifests referenced local images (`backend:v2`,
+`frontend:v4`) built directly inside Minikube's Docker context. These images existed
+only on the local Minikube node and could not be pulled from Docker Hub.
+
+### Decision
+
+Update `Kubernetes/backend/deployment.yaml` and `Kubernetes/frontend/deployment.yaml`
+to reference Docker Hub images:
+```yaml
+image: anshuman04/backend:latest
+imagePullPolicy: Always
+```
+
+### Reasoning
+
+The CI/CD pipeline pushes images to Docker Hub. The Kubernetes cluster must pull from
+the same registry that CI pushes to. `imagePullPolicy: Always` ensures fresh images
+are pulled on every pod start — critical for CI/CD where `:latest` may point to a
+different digest after each push. SHA-tagged deployments via `kubectl set image` remain
+the primary deploy mechanism; the manifest update ensures `kubectl apply` also works.
+
+### Result
+
+`kubectl apply` and `kubectl set image` both produce correct behavior. No dependency
+on locally-built images in Minikube's Docker context.
+
+---
+
+## Decision 39 — Delete and recreate Minikube cluster to resolve etcd data corruption
+
+### Context
+
+After an ungraceful shutdown of the Minikube cluster, etcd entered a state where every
+write operation timed out after 7 seconds. `kubectl set image` failed consistently.
+The etcd pod reported `Healthy` in `componentstatuses` but actual KV writes failed.
+Restarting Minikube did not resolve the issue.
+
+### Decision
+
+Delete the Minikube cluster entirely (`minikube delete`) and recreate from scratch
+(`minikube start`), then re-apply all manifests from `Kubernetes/`.
+
+### Reasoning
+
+etcd's data directory contained stale lease IDs from the previous session that etcd
+could not revoke. This is a known etcd corruption pattern after ungraceful shutdown.
+Restart alone is insufficient — the corrupted WAL (Write-Ahead Log) entries persist.
+Complete deletion clears the data directory. The cost (re-applying manifests, ~5 min)
+is acceptable compared to attempting WAL repair.
+
+Additionally, Colima was restarted with 6GB RAM (previously 2GB). Insufficient memory
+was a contributing factor — etcd requires headroom for write operations beyond what
+2GB can provide when shared with other containers.
+
+### Result
+
+Fresh cluster with etcd writing correctly. All manifests re-applied. Application
+operational.
+
+---
+
+## Decision 40 — Use `kubectl set image` instead of `kubectl apply` for CI/CD deploys
+
+### Context
+
+The CI/CD deploy stage needs to update the running Kubernetes deployments to use the
+newly pushed image tag (`$CI_COMMIT_SHORT_SHA`) without modifying the YAML manifests
+in the repository on every pipeline run.
+
+### Decision
+
+Use `kubectl set image deployment/<name> <container>=<registry>/<image>:$CI_COMMIT_SHORT_SHA -n prod`
+rather than updating the YAML and running `kubectl apply`.
+
+### Reasoning
+
+Updating the YAML manifest to embed a specific SHA on every pipeline run would produce
+a commit per deploy — polluting the Git history with mechanical changes. `kubectl set image`
+updates the running state without touching the source-of-truth manifests. The manifests
+retain `:latest` as the reference for `kubectl apply`-based operations, while the
+running cluster tracks the exact SHA via the Deployment's image field.
+
+### Result
+
+Pipeline deploys using SHA tags without commit noise. Rollback via
+`kubectl rollout undo` works correctly. Git history remains clean.

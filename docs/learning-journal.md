@@ -1150,3 +1150,103 @@ verif.     frontend    scan        analysis
 Remaining Phase 8 work: Trivy FS scan (8.9), Docker builds (8.10–8.11), Trivy image
 scans (8.12), Docker Hub push (8.13), Kubernetes deployment (8.14), rollout verification
 (8.15), failure/recovery exercises (8.16).
+
+---
+
+## Phase 8 — Complete (8A through 8.16)
+
+### On CI/CD as a Trust Problem
+
+Before implementing Phase 8, I thought of CI/CD as automation — a way to run commands
+without typing them. After building it completely, I understand it differently. CI/CD
+is a trust mechanism. It answers the question: "Can I trust that this code is safe to
+deploy?"
+
+The pipeline stages answer specific trust questions in order:
+- `node --check` → can the code even be parsed?
+- GitLeaks → does the code contain credentials?
+- SonarCloud → does the code meet quality standards?
+- Trivy FS → do the dependencies contain known CVEs?
+- Docker build → can a deployable artifact be produced?
+- Trivy image → does the artifact contain OS-level CVEs?
+- Docker push → is the artifact stored where clusters can access it?
+- Deploy → does the artifact run correctly in the target environment?
+
+Each gate is a specific question with a binary answer. The pipeline fails fast — as
+soon as one question has the answer "no", everything stops. Nothing downstream runs
+until upstream trust is established.
+
+What changed my understanding: the Quality Gate debugging. The sonar-scanner kept
+failing with "Not authorized" after uploading successfully. I assumed it was a token
+problem and kept regenerating tokens. It wasn't. The auth model for upload and the
+auth model for QG polling are different. The upload uses project-scoped auth. The
+internal QG polling requires org-level auth. I was solving the wrong problem because
+I hadn't understood which specific API was failing and why.
+
+The lesson: when the same fix doesn't work twice, stop and re-read the error. The
+error message is the root cause, not a hint.
+
+### On Port 80 and the Wrong Application
+
+The most embarrassing failure of Phase 8 was telling the user HTTP 200 was proof of
+the correct application, when it was actually serving a completely different project.
+
+The `curl` returned 200. I stopped there. I should have verified the response body —
+specifically checking the page title or making an application-specific API call. "HTTP
+200 from the right host" is not the same as "the right application is running."
+
+The actual problem was a port conflict: `chat-nginx` was binding `0.0.0.0:80` on
+Colima, which intercepted all traffic to `127.0.0.1:80` before `minikube tunnel` could
+reach Kubernetes.
+
+Correct verification pattern going forward:
+1. Check pod image (`kubectl describe pod | grep Image`)
+2. Check pod content (`kubectl exec -- cat /usr/share/nginx/html/index.html`)
+3. Make an application-specific API call (not just a health check)
+4. Human confirmation in browser
+
+### On etcd and What "Healthy" Actually Means
+
+`kubectl get componentstatuses` reported etcd as "Healthy". But every write operation
+timed out. This contradiction confused me for a while.
+
+The health check for etcd reports whether the process is running and reachable. It does
+not report whether write consensus is working. etcd can be "Healthy" (process up,
+responding to pings) while simultaneously being unable to commit writes because of
+stale leases blocking the Raft log.
+
+The correct diagnostic tool was the etcd logs:
+```bash
+kubectl logs etcd-minikube -n kube-system --tail=20
+```
+
+Those showed every `KV/Txn` timing out at exactly 7 seconds — the same two lease IDs
+on every failure. That's a stuck Raft entry, not a process failure. The health check
+can't see it. The logs can.
+
+Going forward: when a component reports Healthy but operations fail, go to the logs.
+`componentstatuses` is a coarse-grained indicator, not a diagnostic tool.
+
+### On Rolling Updates as a Safety Guarantee
+
+Phase 8.16 made rolling updates concrete. Kubernetes didn't just "update the
+application" — it kept the old pod running until the new one was Ready. While the
+new pod was stuck in `ImagePullBackOff`, the old pod kept serving traffic. The
+application never went down.
+
+This is not magic. It is a deliberate design constraint: `maxUnavailable: 0` in the
+default rolling update strategy means zero pods are terminated until a replacement
+is Ready. The cost is that a broken deploy can stall indefinitely — but it never
+causes downtime.
+
+The right mental model: a rolling update is a slow atomic swap. You don't swap until
+the new version is confirmed working. If it never works, you never swap.
+
+---
+
+## Phase 8 — Status: COMPLETE
+
+All 12 sub-phases completed. Full DevSecOps pipeline operational. Application
+deployed to Minikube from GitLab CI/CD. Failure and recovery exercised.
+
+**Next: Phase 9 — Production Kubernetes Hardening**
