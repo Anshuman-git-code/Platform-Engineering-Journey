@@ -112,20 +112,27 @@ gitleaks-scan:
 # Architecture:
 #   sonar-scanner submits analysis to SonarCloud (no internal polling)
 #     → scanner exits immediately after upload
-#     → CI job polls SonarCloud QG API directly via curl
-#     → parses JSON status field
-#     → exits non-zero if status != OK -> pipeline stops
+#     → CI job polls SonarCloud QG API directly via curl (up to 12×15s)
+#     → SonarCloud processes asynchronously: NONE → OK / ERROR
+#     → exits non-zero if status != OK → pipeline stops
 #
 # Why not sonar.qualitygate.wait=true:
 #   sonar-scanner's internal QG polling requires the token to have
 #   Execute Analysis permission at the organization level. Project-scoped
 #   tokens do not have this permission, causing exit code 3 "Not authorized"
-#   immediately after analysis upload. The direct API approach uses the same
-#   endpoint but with Basic Auth, which works with project-scoped tokens.
+#   immediately after analysis upload. The direct API approach uses Bearer
+#   token auth, which works with project-scoped tokens.
+#
+# Why polling loop instead of single curl call:
+#   SonarCloud processes analysis reports asynchronously. The status is NONE
+#   until the server finishes computing the Quality Gate — typically 15–60s
+#   after upload. A single call too early returns NONE which is not a failure;
+#   the loop polls every 15s for up to 3 minutes, breaking on any non-NONE status.
 #
 # Quality Gate API:
-#   GET /api/qualitygates/project_status?projectKey=...&branch=...
-#   Response: {"projectStatus": {"status": "OK" | "ERROR" | "NONE"}}
+#   GET /api/qualitygates/project_status?projectKey=...
+#   Auth: Bearer $SONAR_TOKEN (Authorization header)
+#   Response: {"projectStatus": {"status": "NONE"|"OK"|"WARN"|"ERROR"}}
 #
 # SONAR_TOKEN is stored as a masked GitLab CI variable.
 # It is never written in this file.
@@ -137,23 +144,31 @@ sonarcloud-analysis:
   script:
     - echo "Running SonarCloud static analysis..."
     - sonar-scanner -Dsonar.host.url=https://sonarcloud.io -Dsonar.token=$SONAR_TOKEN -Dsonar.scanner.skipJreProvisioning=true
-    - echo "Analysis submitted. Waiting 15s for SonarCloud to process the report..."
-    - sleep 15
+    - echo "Analysis submitted. Polling SonarCloud Quality Gate status..."
     - |
-      RESPONSE=$(curl -s -H "Authorization: Bearer $SONAR_TOKEN" \
-        "https://sonarcloud.io/api/qualitygates/project_status?projectKey=platform-engineering-journey")
-      echo "API response: $RESPONSE"
-      QG_STATUS=$(echo "$RESPONSE" | python3 -c "
+      QG_STATUS="NONE"
+      for i in $(seq 1 12); do
+        sleep 15
+        RESPONSE=$(curl -s -H "Authorization: Bearer $SONAR_TOKEN" \
+          "https://sonarcloud.io/api/qualitygates/project_status?projectKey=platform-engineering-journey")
+        echo "Attempt $i/12 — API response: $RESPONSE"
+        QG_STATUS=$(echo "$RESPONSE" | python3 -c "
       import sys, json
       data = json.load(sys.stdin)
       if 'errors' in data:
-          print('ERROR: ' + str(data['errors']))
-          sys.exit(2)
+          print('API_ERROR')
+          sys.exit(0)
       print(data['projectStatus']['status'])
-      ")
-      echo "Quality Gate status: $QG_STATUS"
-      if [ "$QG_STATUS" != "OK" ]; then
-        echo "Quality Gate FAILED — pipeline stopped. Status: $QG_STATUS"
+        ")
+        echo "Quality Gate status: $QG_STATUS"
+        if [ "$QG_STATUS" != "NONE" ]; then
+          break
+        fi
+        echo "Report still processing... retrying in 15s"
+      done
+      if [ "$QG_STATUS" = "OK" ]; then
+        echo "Quality Gate PASSED."
+      else
+        echo "Quality Gate FAILED or timed out. Final status: $QG_STATUS"
         exit 1
       fi
-      echo "Quality Gate PASSED."
