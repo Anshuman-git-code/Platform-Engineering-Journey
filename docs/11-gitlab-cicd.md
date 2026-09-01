@@ -2269,3 +2269,265 @@ verify → validate → secret-scan → code-quality → security-scan
 
 **Total jobs: 10 across 9 stages**
 **Next: Phase 8.16 — Failure/Recovery Exercise (deliberate bad deploy → rollback)**
+
+---
+
+## Phase 8.16 — Failure/Recovery Exercise
+
+### Engineering Problem
+
+A CI/CD pipeline that only deploys successfully is incomplete as an engineering
+exercise. Production failures happen — a bad image tag gets pushed, a container
+crashes on startup, a configuration error slips through. The ability to diagnose
+a stalled rollout and execute a controlled rollback is a required operational skill.
+
+This exercise deliberately injects a failure, observes the Kubernetes safety
+mechanisms, diagnoses the failure using the correct tools, and recovers via rollback.
+
+### Pre-State
+
+Before the exercise, the cluster was in a known-good state:
+
+```bash
+$ kubectl rollout history deployment/backend -n prod
+REVISION  CHANGE-CAUSE
+1         <none>
+2         <none>
+...
+5         <none>
+
+$ kubectl get pods -n prod
+NAME                        READY   STATUS    RESTARTS   AGE
+backend-795888bc47-gfv28    1/1     Running   0          126m   ← image: anshuman04/backend:c4ea434d
+frontend-6b86db8676-*       1/1     Running   0          126m
+mysql-6686999677-7vhhx      1/1     Running   0          153m
+```
+
+Application confirmed serving HTTP 200 at `http://crud.local`.
+
+### Step 1 — Inject the Bad Deploy
+
+```bash
+$ kubectl set image deployment/backend \
+    backend=anshuman04/backend:this-tag-does-not-exist \
+    -n prod
+
+deployment.apps/backend image updated
+```
+
+Kubernetes accepts the command immediately — it does not validate whether the image
+tag exists on the registry. Validation happens when the kubelet attempts to pull
+the image on the node.
+
+### Step 2 — Observe the Stall
+
+```bash
+$ kubectl get pods -n prod   # run 20 seconds after inject
+
+NAME                        READY   STATUS             RESTARTS   AGE
+backend-795888bc47-gfv28    1/1     Running            0          127m   ← OLD pod STILL RUNNING
+backend-7cb96b94b4-jnx8p    0/1     ImagePullBackOff   0          31s    ← NEW pod FAILING
+frontend-6b86db8676-*       1/1     Running            0          127m
+mysql-6686999677-7vhhx      1/1     Running            0          154m
+```
+
+**Critical observation:** The old pod (`backend-795888bc47-gfv28`) is still Running.
+Kubernetes does NOT terminate existing pods until the new pod reaches `Ready`.
+This is the rolling update safety guarantee — the application keeps serving traffic
+during a failed rollout.
+
+```bash
+$ kubectl rollout status deployment/backend -n prod --timeout=10s
+
+Waiting for deployment "backend" rollout to finish: 1 old replicas are pending termination...
+error: timed out waiting for the condition
+```
+
+The rollout status command confirms the deployment is stalled. In a CI/CD pipeline,
+this would fail the deploy stage and alert the team.
+
+### Step 3 — Diagnose the Failure
+
+```bash
+$ kubectl describe pod backend-7cb96b94b4-jnx8p -n prod | grep -A12 "Events:"
+
+Events:
+  Normal   Pulling  28s (x2 over 44s)  kubelet  Pulling image
+           "anshuman04/backend:this-tag-does-not-exist"
+
+  Warning  Failed   25s (x2 over 41s)  kubelet  Failed to pull image
+           "anshuman04/backend:this-tag-does-not-exist":
+           manifest unknown: manifest unknown
+
+  Warning  Failed   25s (x2 over 41s)  kubelet  Error: ErrImagePull
+
+  Warning  Failed   11s (x2 over 41s)  kubelet  Error: ImagePullBackOff
+
+  Normal   BackOff  11s (x2 over 41s)  kubelet  Back-off pulling image
+```
+
+**Root cause confirmed:** `manifest unknown` — the image tag does not exist on
+Docker Hub. The kubelet attempted to pull, received a 404 from the registry,
+and entered exponential backoff (`ImagePullBackOff`).
+
+**Failure classification:**
+```
+Application logic? No
+Container? No
+Image? YES — manifest unknown → tag does not exist on registry
+```
+
+### Step 4 — Verify Application Still Serving During Failure
+
+```bash
+$ kubectl port-forward service/backend 5001:5000 -n prod &
+$ curl -s -o /dev/null -w "Backend still responding: HTTP %{http_code}\n" \
+    -X POST http://localhost:5001/api/auth/login \
+    -H "Content-Type: application/json" \
+    -d '{"email":"admin@example.com","password":"admin123"}'
+
+Backend still responding: HTTP 200
+```
+
+Zero downtime during the bad rollout. The old pod continued serving all traffic.
+This is the correct behavior — rolling updates protect against this exact scenario.
+
+### Step 5 — Roll Back
+
+```bash
+$ kubectl rollout undo deployment/backend -n prod
+
+deployment.apps/backend rolled back
+```
+
+`kubectl rollout undo` reverts to the previous ReplicaSet (revision 5 → revision 4).
+Kubernetes reuses the existing ReplicaSet from the previous good deploy — no new
+image pull is required since that image is already cached on the node.
+
+```bash
+$ kubectl rollout status deployment/backend -n prod --timeout=60s
+
+deployment "backend" successfully rolled out
+```
+
+### Step 6 — Verify Recovery
+
+```bash
+$ kubectl get pods -n prod
+
+NAME                        READY   STATUS    RESTARTS   AGE
+backend-795888bc47-gfv28    1/1     Running   0          128m   ← same pod as before bad deploy
+frontend-6b86db8676-*       1/1     Running   0          128m
+mysql-6686999677-7vhhx      1/1     Running   0          156m
+
+$ kubectl describe pod -n prod -l app=backend | grep "Image:"
+
+    Image: anshuman04/backend:c4ea434d   ← correct image restored
+```
+
+Pod name `backend-795888bc47-gfv28` is identical to the pre-failure state —
+Kubernetes reactivated the previous ReplicaSet without creating new pods.
+
+Application confirmed serving HTTP 200 after rollback. `http://crud.local`
+accessible in browser. Login and dashboard working.
+
+### Rollout History After Exercise
+
+```bash
+$ kubectl rollout history deployment/backend -n prod
+
+REVISION  CHANGE-CAUSE
+1         <none>
+...
+5         <none>    ← good deploy (c4ea434d)
+6         <none>    ← bad deploy (this-tag-does-not-exist)
+7         <none>    ← rollback (restored revision 5 as new revision 7)
+```
+
+`rollout undo` does not revert history — it creates a new revision pointing to the
+previous configuration. This preserves the audit trail.
+
+### Complete Failure/Recovery Pattern
+
+```
+Symptom observed:
+    kubectl get pods → ImagePullBackOff on new pod
+                    │
+                    ▼
+Diagnose:
+    kubectl describe pod <failing-pod> -n prod
+        → Events: "manifest unknown" or "ErrImagePull"
+        → Identify: image layer problem
+                    │
+                    ▼
+Confirm application still serving:
+    kubectl port-forward service/backend 5001:5000 -n prod &
+    curl localhost:5001/api/auth/login → HTTP 200
+        → Old pod still Running → no downtime
+                    │
+                    ▼
+Rollback:
+    kubectl rollout undo deployment/backend -n prod
+    kubectl rollout status deployment/backend -n prod --timeout=60s
+        → "successfully rolled out"
+                    │
+                    ▼
+Verify:
+    kubectl get pods -n prod → all Running
+    kubectl describe pod -l app=backend | grep Image: → correct image
+    curl API → HTTP 200
+    Browser → application working
+```
+
+### Key Engineering Lessons
+
+**Lesson 1 — Rolling updates are the safety net.**
+Kubernetes never terminates old pods until new pods are Ready. A broken image
+tag cannot cause downtime — the worst outcome is a stalled rollout while the
+existing version keeps running.
+
+**Lesson 2 — `ImagePullBackOff` is always an image/registry problem.**
+The kubelet pulled successfully in previous deployments. If it fails now, the
+cause is one of:
+- Tag does not exist on registry
+- Registry authentication failed
+- Registry is unreachable
+- Image was deleted after push
+
+**Lesson 3 — `kubectl rollout undo` is instant for image changes.**
+Because Kubernetes keeps previous ReplicaSets, rolling back requires only
+reactivating an existing set — no new image pull, no rebuild. Recovery is
+as fast as the kubelet can start the pod.
+
+**Lesson 4 — `rollout undo` creates a new revision, not a revert.**
+This preserves the full audit trail. You can see that revision 6 was the bad
+deploy and revision 7 is the rollback. In production, add `--record` flag
+(deprecated) or use annotations to label change-cause for traceability.
+
+---
+
+## Phase 8.16 Status: Complete
+
+Failure/recovery exercise completed successfully. Bad image tag deployed,
+`ImagePullBackOff` diagnosed via `kubectl describe`, zero downtime confirmed
+during stall, `kubectl rollout undo` executed, application recovered.
+
+**Phase 8 — GitLab CI/CD: ALL SUB-PHASES COMPLETE**
+
+```
+8A  ✅ GitLab Runner setup and verification
+8.5 ✅ JavaScript syntax validation (node --check)
+8.6 ✅ GitLeaks secret scanning
+8.7 ✅ SonarCloud static analysis
+8.8 ✅ Quality Gate enforcement
+8.9 ✅ Trivy filesystem scan
+8.10 ✅ Backend Docker build
+8.11 ✅ Frontend Docker build
+8.12 ✅ Trivy image scans (manual)
+8.13 ✅ Docker Hub push (manual)
+8.14 ✅ Kubernetes deployment to Minikube (manual)
+8.15 ✅ Rollout verification (browser confirmed)
+8.16 ✅ Failure/recovery exercise (rollback confirmed)
+```
+
+**Next Phase: Phase 9 — Production Kubernetes Hardening**
