@@ -17,6 +17,40 @@ app.use(bodyParser.json());
 app.use('/api/auth', authRoutes);    // 🔐 Login/Register
 app.use('/api/users', userRoutes);   // 👤 User management
 
+// ─────────────────────────────────────────────────────
+// Health endpoint — used by Kubernetes readiness and liveness probes
+//
+// Readiness probe: confirms the server is running AND MySQL is reachable.
+// A pod passes readiness only when this endpoint returns 200.
+// Until it does, Kubernetes keeps the pod out of the Service's endpoint
+// list — no traffic is routed to it.
+//
+// Liveness probe: confirms the process has not entered a broken state.
+// If this endpoint stops responding, Kubernetes restarts the container.
+//
+// Why check MySQL here:
+//   The backend is only useful if it can reach the database. A pod where
+//   Express is running but MySQL is unreachable would accept requests and
+//   return 500s on every DB operation. The readiness probe prevents this
+//   by keeping such a pod out of rotation until the DB connection is healthy.
+// ─────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+  db.query('SELECT 1', (err) => {
+    if (err) {
+      console.error('❌ Health check failed — DB unreachable:', err.message);
+      return res.status(503).json({
+        status: 'unhealthy',
+        database: 'unreachable',
+        error: err.message
+      });
+    }
+    res.status(200).json({
+      status: 'healthy',
+      database: 'connected'
+    });
+  });
+});
+
 // Auto-create or reset admin user
 const initAdminUser = async () => {
   const name = 'Admin User';
