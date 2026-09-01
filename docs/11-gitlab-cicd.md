@@ -1455,3 +1455,220 @@ Findings documented for Phase 9 remediation.
 **Current pipeline stages:** verify → validate → secret-scan → code-quality → security-scan
 **Pipeline: 6 jobs, all passing**
 **Next: Phase 8.10 — Backend Docker Build**
+
+---
+
+## Phase 8.10 + 8.11 — Docker Image Builds (Backend + Frontend)
+
+### Engineering Problem
+
+The application source code and Kubernetes manifests exist separately. Kubernetes
+cannot deploy source code — it deploys container images. Building images in CI ensures
+that every commit that passes all upstream gates (syntax, secrets, static analysis,
+vulnerability scan) produces a deployable artifact tagged to that exact commit.
+
+### Tag Strategy
+
+Two tags are applied to every image on every build:
+
+```
+anshuman04/backend:f241ec1    ← CI_COMMIT_SHORT_SHA — exact, traceable
+anshuman04/backend:latest     ← convenience, always points to most recent build
+```
+
+The SHA tag is what Kubernetes deployment manifests reference. Using the SHA makes
+the running state of the cluster directly traceable to a Git commit — you can inspect
+any pod and know exactly which code it is running.
+
+### Backend Build — `build-backend` job
+
+```
+docker build
+  -t anshuman04/backend:$CI_COMMIT_SHORT_SHA
+  -t anshuman04/backend:latest
+  ./api
+```
+
+Single-stage build from `node:22-alpine`. Dockerfile:
+1. Copy `package*.json` → `npm install --only=production` (no devDependencies)
+2. Copy application source
+3. EXPOSE 5000, CMD `node app.js`
+
+**Verified output (job #16221540278, commit `f241ec1`):**
+
+```
+Successfully built 655d4960c57b
+Successfully tagged anshuman04/backend:f241ec1
+Successfully tagged anshuman04/backend:latest
+
+REPOSITORY           TAG         IMAGE ID       DISK USAGE
+anshuman04/backend   f241ec1     655d4960c57b   248MB
+anshuman04/backend   latest      655d4960c57b   248MB
+
+Job succeeded
+```
+
+Total image size: 248MB (node:22-alpine base + production dependencies + source).
+
+### Frontend Build — `build-frontend` job
+
+```
+docker build
+  -t anshuman04/frontend:$CI_COMMIT_SHORT_SHA
+  -t anshuman04/frontend:latest
+  ./client
+```
+
+Multi-stage build:
+
+```
+Stage 1: node:22-alpine (builder)
+    COPY package.json package-lock.json → npm ci
+    COPY source → npm run build
+    Output: /app/build (compiled static files)
+                │
+                │  COPY --from=builder /app/build /usr/share/nginx/html
+                ▼
+Stage 2: nginx:alpine (production image)
+    Contains: compiled JS/CSS/HTML + Nginx binary ONLY
+    Does NOT contain: Node.js, react-scripts, webpack, babel, or any npm package
+```
+
+**Verified output (job #16221540283, commit `f241ec1`):**
+
+```
+Step 8/12 : RUN npm run build
+> react-scripts build
+Creating an optimized production build...
+Compiled with warnings.
+File sizes after gzip:
+  88.26 kB  build/static/js/main.3a6ca719.js
+   2.33 kB  build/static/css/main.3aa1d2fd.cssq
+
+Successfully built 8d03f5ca3ac6
+Successfully tagged anshuman04/frontend:f241ec1
+Successfully tagged anshuman04/frontend:latest
+
+REPOSITORY            TAG         IMAGE ID       DISK USAGE
+anshuman04/frontend   f241ec1     8d03f5ca3ac6   94.4MB
+anshuman04/frontend   latest      8d03f5ca3ac6   94.4MB
+
+Job succeeded
+```
+
+Total image size: 94.4MB (nginx:alpine + ~91KB of compiled static files).
+
+**Note:** React build produced one ESLint warning (`useEffect` missing dependency in
+`UserDashboard.js`). This is a code quality finding, not a build failure. It is visible
+on the SonarCloud dashboard. Remediation: add `fetchUsers` to the dependency array or
+disable with `// eslint-disable-next-line`.
+
+---
+
+## Phase 8.12 — Trivy Image Scans
+
+### Engineering Problem
+
+The filesystem scan (Phase 8.9) checked application source dependencies. It did not
+check the base images. `node:22-alpine` and `nginx:alpine` may contain OS-level
+CVEs (Alpine packages, system libraries) that are not visible in `package-lock.json`.
+
+The image scan runs Trivy against the fully built image — OS packages, installed
+libraries, and application layers are all inspected.
+
+### Architecture
+
+```
+trivy image anshuman04/backend:$CI_COMMIT_SHORT_SHA
+    → pulls image from local Docker daemon
+    → scans: Alpine OS packages + node_modules in image
+    → reports HIGH/CRITICAL CVEs
+    → exits 0 (report-only, learning phase)
+
+trivy image anshuman04/frontend:$CI_COMMIT_SHORT_SHA
+    → scans: Alpine OS packages + Nginx in final stage only
+    → build toolchain NOT present (multi-stage build)
+    → exits 0
+```
+
+Both jobs are `when: manual` — triggered by clicking play in the GitLab UI.
+
+---
+
+## Phase 8.13 — Docker Hub Push
+
+### Engineering Problem
+
+Images built in the `build` stage exist only in the runner Mac's local Docker daemon.
+They are not accessible to any cluster. Pushing to Docker Hub makes images available
+to Minikube (Phase 8.14) and future AWS EKS (Phase 12) via standard `docker pull`.
+
+### Authentication
+
+`DOCKER_HUB_USERNAME` and `DOCKER_HUB_TOKEN` are stored as masked GitLab CI variables.
+The push job uses `--password-stdin` to prevent the token from appearing in process
+listings or logs:
+
+```yaml
+echo "$DOCKER_HUB_TOKEN" | docker login -u "$DOCKER_HUB_USERNAME" --password-stdin
+```
+
+`docker logout` runs after push to remove credentials from the runner's Docker config.
+
+### Verified Push Output (job on commit `f241ec1`)
+
+```
+Logging in to Docker Hub...
+Login Succeeded
+
+Pushing backend image...
+anshuman04/backend:f241ec1  → digest: sha256:655d4960c57b...
+anshuman04/backend:latest   → digest: sha256:655d4960c57b...
+
+Pushing frontend image...
+anshuman04/frontend:f241ec1 → digest: sha256:8d03f5ca3ac6...
+anshuman04/frontend:latest  → digest: sha256:8d03f5ca3ac6...
+
+All images pushed successfully.
+Removing login credentials for https://index.docker.io/v1/
+
+Job succeeded
+```
+
+**Images on Docker Hub:**
+
+| Image | Tags | Size |
+|---|---|---|
+| `anshuman04/backend` | `f241ec1`, `latest` | 248MB |
+| `anshuman04/frontend` | `f241ec1`, `latest` | 94.4MB |
+
+The `5de55e5ef9c0: Mounted from [MASKED]/backend` line in the frontend push confirms
+Docker Hub deduplication — the shared Alpine base layer between backend and frontend
+was not re-uploaded, it was mounted from the already-existing backend repository.
+
+### Production Considerations
+
+The current pipeline builds and pushes on every manual trigger. In production:
+
+- SHA-tagged images are immutable — never overwrite a SHA tag
+- `:latest` is mutable — acceptable for convenience but Kubernetes deployments should
+  always reference the SHA tag
+- Add `imagePullPolicy: Always` to Kubernetes deployments when using `:latest` to
+  force re-pulls (not needed with SHA tags since the image ID is unique)
+- Consider a separate registry per environment (dev, staging, prod) to prevent
+  a broken prod deploy from accidentally pulling a dev image
+
+---
+
+## Phase 8.10–8.13 Status: Complete
+
+Backend and frontend images built, scanned, and pushed to Docker Hub. Pipeline
+confirmed passing across all 8 jobs in 8 stages.
+
+**Current pipeline stages:**
+```
+verify → validate → secret-scan → code-quality → security-scan → build → image-scan → push
+                                                                          (manual)      (manual)
+```
+
+**Next: Phase 8.14 — Kubernetes Deployment to Minikube**

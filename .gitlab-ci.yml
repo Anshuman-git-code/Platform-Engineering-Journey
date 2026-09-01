@@ -7,6 +7,7 @@ stages:
   - build
   - image-scan
   - push
+  - deploy
 
 # ─────────────────────────────────────────────────────
 # Phase 8A — Runner Verification
@@ -480,3 +481,70 @@ push-images:
     - docker push anshuman04/frontend:latest
     - echo "All images pushed successfully."
     - docker logout
+
+# ─────────────────────────────────────────────────────
+# Phase 8.14 — Kubernetes Deployment to Minikube
+#
+# Engineering problem:
+#   Images are on Docker Hub. The Kubernetes cluster
+#   must be told to pull the new images and perform a
+#   rolling update. This connects the CI/CD pipeline
+#   to the runtime environment — completing the full
+#   DevSecOps loop: code → build → scan → push → deploy.
+#
+# Approach — kubectl set image:
+#   Rather than modifying YAML manifests in the pipeline,
+#   `kubectl set image` updates the running deployment's
+#   image reference in-place. This triggers a rolling
+#   update: new pods start with the new image, old pods
+#   terminate only after new pods are Ready.
+#
+# Why kubectl set image instead of kubectl apply:
+#   The manifests in Kubernetes/ still reference the old
+#   local image names (backend:v2, frontend:v4). Applying
+#   them would revert the deployment to the local images.
+#   `kubectl set image` updates only the image field of the
+#   running deployment — all other manifest fields stay as-is.
+#   The manifests will be updated to Docker Hub references
+#   in Phase 9.
+#
+# Pre-condition:
+#   Minikube must be running and kubectl must be pointing
+#   to the Minikube context when this job executes.
+#   The job uses `|| true` on minikube status to not fail
+#   if the cluster is stopped — but the deploy will fail
+#   if the cluster is actually unreachable.
+#
+# imagePullPolicy:
+#   The current manifests use IfNotPresent. After kubectl
+#   set image, Minikube will pull from Docker Hub because
+#   the image reference changes (new SHA tag is new image).
+#
+# why: manual — Minikube must be running on your Mac.
+#   This stage requires the local cluster to be active.
+#   Trigger manually after confirming minikube is running.
+# ─────────────────────────────────────────────────────
+deploy-to-minikube:
+  stage: deploy
+  tags:
+    - macos
+  when: manual
+  script:
+    - echo "Deploying to Minikube..."
+    - minikube status
+    - kubectl config use-context minikube
+    - echo "Updating backend deployment image..."
+    - kubectl set image deployment/backend
+      backend=anshuman04/backend:$CI_COMMIT_SHORT_SHA
+      -n prod
+    - echo "Updating frontend deployment image..."
+    - kubectl set image deployment/frontend
+      frontend=anshuman04/frontend:$CI_COMMIT_SHORT_SHA
+      -n prod
+    - echo "Waiting for rollouts to complete..."
+    - kubectl rollout status deployment/backend -n prod --timeout=120s
+    - kubectl rollout status deployment/frontend -n prod --timeout=120s
+    - echo "Deployment complete. Verifying pods..."
+    - kubectl get pods -n prod
+    - echo "Verifying services..."
+    - kubectl get services -n prod
