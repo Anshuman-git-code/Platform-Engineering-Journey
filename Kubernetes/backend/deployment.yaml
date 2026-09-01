@@ -52,6 +52,29 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 20
             failureThreshold: 3
+          # ─────────────────────────────────────────────
+          # Resource Requests + Limits (Phase 9.3 + 9.4)
+          #
+          # Requests: minimum guaranteed resources.
+          # The scheduler uses these to find a node with
+          # enough available capacity. The pod is never
+          # placed on a node that cannot satisfy requests.
+          #
+          # Limits: maximum allowed resources.
+          # If the container exceeds memory limit → OOMKilled.
+          # If it exceeds CPU limit → throttled (not killed).
+          #
+          # Values chosen for Minikube (2 CPU, 6GB RAM):
+          #   Backend is a Node.js API — lightweight at rest,
+          #   needs headroom for concurrent JWT + DB operations.
+          # ─────────────────────────────────────────────
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
           env:
             - name: DB_HOST
               valueFrom:

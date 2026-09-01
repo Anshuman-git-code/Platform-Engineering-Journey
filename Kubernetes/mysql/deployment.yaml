@@ -21,6 +21,23 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 3306
+          # ─────────────────────────────────────────────
+          # Resource Requests + Limits (Phase 9.3 + 9.4)
+          #
+          # MySQL 8 needs meaningful memory for InnoDB buffer pool.
+          # Request 256Mi to ensure it's placed on a node with
+          # sufficient memory. Limit 512Mi prevents it from
+          # consuming all available memory on the node.
+          # CPU request is low — MySQL is IO-bound, not CPU-bound
+          # for this workload size.
+          # ─────────────────────────────────────────────
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
           env:
             - name: MYSQL_ROOT_PASSWORD
               valueFrom:

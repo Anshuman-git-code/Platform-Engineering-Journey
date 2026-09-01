@@ -28,3 +28,18 @@ spec:
 
           ports:
             - containerPort: 80
+          # ─────────────────────────────────────────────
+          # Resource Requests + Limits (Phase 9.3 + 9.4)
+          #
+          # Frontend is nginx:alpine serving static files.
+          # CPU usage is minimal — only during TLS/gzip.
+          # Memory footprint is tiny — no Node.js at runtime.
+          # 3 replicas × 32Mi = 96Mi total for all frontend pods.
+          # ─────────────────────────────────────────────
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "64Mi"
