@@ -2179,9 +2179,84 @@ Verified via kubectl port-forward:
   POST localhost:5001/api/auth/login         → 200 (backend + MySQL)
 ```
 
----
+### Additional Debugging — Wrong App Served at `http://crud.local`
 
-## Phase 8.15 Status: Complete
+**Symptom:** Browser showed a different application at `http://crud.local` — a previous
+project's chat application, not the user management dashboard.
+
+**Diagnosis:**
+
+```bash
+# Check what is actually serving port 80 on localhost
+curl -s http://127.0.0.1:80/ | grep -i "title"
+# Output: <title>Real-Time Chat | FastAPI</title>
+# → Port 80 is being served by chat-nginx from another project
+
+# Check /etc/hosts
+grep "crud.local" /etc/hosts
+# Output: 127.0.0.1  crud.local
+# → crud.local resolves to 127.0.0.1, not Minikube IP
+
+# Check what container is on port 80
+docker ps | grep "0.0.0.0:80"
+# Output: chat-nginx  nginx:alpine  "0.0.0.0:80->80/tcp"
+```
+
+**Root cause:** The `chat-nginx` container from a previous project was binding port 80
+on `0.0.0.0` (all interfaces). When `minikube tunnel` routes `crud.local → 127.0.0.1:80`,
+the chat-nginx container intercepted the traffic before Minikube's tunnel could handle it.
+
+```
+Browser → crud.local → 127.0.0.1 (/etc/hosts)
+                          │
+                          ├── Port 80 occupied by chat-nginx → WRONG APP
+                          └── Minikube tunnel cannot bind port 80 → blocked
+```
+
+**Fix:**
+```bash
+docker stop chat-nginx       # free port 80
+minikube tunnel              # now binds port 80 → routes to Minikube Ingress
+```
+
+**After fix — correct routing:**
+```
+Browser → crud.local → 127.0.0.1:80 → minikube tunnel
+                                          → Minikube Ingress (crud.local)
+                                            → frontend service
+                                              → frontend pod (Nginx + React)
+```
+
+**Browser verification (human-confirmed):**
+- Login page loaded: "Anshuman Mohapatra – User Management" ✅
+- Login with `admin@example.com` / `admin123` succeeded ✅
+- User Management Dashboard displayed correctly ✅
+- CRUD operations functional ✅
+
+**Engineering lesson:** `curl` returning HTTP 200 is not sufficient proof that the
+correct application is running. Always verify the response content — check the page
+title, the HTML structure, or make an API call that is specific to the expected
+application (such as the login endpoint returning a JWT with known user data).
+
+**Correct verification pattern:**
+```bash
+# 1. Verify pod image
+kubectl describe pod <frontend-pod> -n prod | grep Image:
+# → anshuman04/frontend:c4ea434d ✅
+
+# 2. Verify pod content
+kubectl exec <frontend-pod> -n prod -- grep -i "title" /usr/share/nginx/html/index.html
+# → <title>Anshuman Mohapatra – User Management</title> ✅
+
+# 3. Verify backend returns application-specific data
+curl -X POST http://localhost:5001/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@example.com","password":"admin123"}'
+# → {"token":"...","user":{"id":1,"name":"Admin User","role":"admin"}} ✅
+
+# 4. Human verification in browser
+# → http://crud.local → login form → dashboard → CRUD working ✅
+```
 
 Application verified end-to-end after pipeline deployment. Frontend HTTP 200,
 backend login API HTTP 200 (MySQL connected). Full DevSecOps loop operational.
