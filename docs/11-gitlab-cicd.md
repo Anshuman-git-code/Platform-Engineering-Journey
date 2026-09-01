@@ -2036,3 +2036,161 @@ verify → validate → secret-scan → code-quality → security-scan
 ```
 
 **Next: Phase 8.15 — Rollout Verification (end-to-end application test post-deploy)**
+
+---
+
+## Phase 8.15 — Rollout Verification
+
+### Engineering Problem
+
+A successful `kubectl rollout status` confirms that pods reached the `Ready` state.
+It does not confirm that the application inside the pods is actually functioning —
+a pod can be `Running` and `Ready` while the application has a startup error, a
+misconfigured environment variable, or a broken database connection.
+
+End-to-end verification proves the full stack is operational: frontend serves HTML,
+backend accepts API requests, backend connects to MySQL.
+
+### Network Access Pattern — Docker Driver
+
+Minikube running inside a Docker container (Docker driver) isolates its network
+from the macOS host. NodePort services are not directly reachable via `minikube ip`
+from the terminal. Two access methods work:
+
+```
+Option A: kubectl port-forward
+    kubectl port-forward service/<name> <local-port>:<service-port> -n prod
+    → Creates a temporary tunnel from localhost to the pod
+    → Works without minikube tunnel
+    → Suitable for scripted verification
+
+Option B: minikube tunnel (interactive)
+    minikube tunnel
+    → Requires sudo, runs in foreground
+    → Exposes all LoadBalancer services via localhost
+    → Suitable for browser-based testing
+```
+
+### Verification Commands and Results
+
+**Step 1 — Confirm all pods Running:**
+
+```bash
+$ kubectl get pods -n prod
+NAME                        READY   STATUS    RESTARTS   AGE
+backend-795888bc47-gfv28    1/1     Running   0          13m
+frontend-6b86db8676-csxhl   1/1     Running   0          13m
+frontend-6b86db8676-l9p6j   1/1     Running   0          13m
+frontend-6b86db8676-r6bjn   1/1     Running   0          13m
+mysql-6686999677-7vhhx      1/1     Running   0          40m
+```
+
+All 5 pods Running. Backend 1/1, Frontend 3/3 (3 replicas), MySQL 1/1.
+
+**Step 2 — Verify frontend serves HTTP 200:**
+
+```bash
+$ kubectl port-forward service/frontend 8080:80 -n prod &
+$ curl -s -o /dev/null -w "Frontend HTTP: %{http_code}\n" http://localhost:8080/
+
+Frontend HTTP: 200
+```
+
+Nginx serving the compiled React app. HTTP 200 confirms the multi-stage Docker build
+produced a valid static bundle and Nginx is configured correctly.
+
+**Step 3 — Verify backend API responds:**
+
+```bash
+$ kubectl port-forward service/backend 5001:5000 -n prod &
+$ curl -s -o /dev/null -w "Backend HTTP: %{http_code}\n" \
+    -X POST http://localhost:5001/api/auth/login \
+    -H "Content-Type: application/json" \
+    -d '{"email":"admin@example.com","password":"admin123"}'
+
+Backend /api/auth/login HTTP: 200
+```
+
+HTTP 200 from `/api/auth/login` confirms:
+1. Backend container started correctly
+2. Express server is listening on port 5000
+3. Backend connected to MySQL (login requires DB query)
+4. bcrypt password verification worked
+5. JWT was generated and returned
+
+The `404` on `GET /` is correct — the backend has no route for the root path.
+All routes are under `/api/`.
+
+**Step 4 — Confirm service configuration:**
+
+```bash
+$ kubectl get services -n prod
+NAME       TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)
+backend    NodePort    10.96.237.178    <none>        5000:31973/TCP
+frontend   NodePort    10.100.228.149   <none>        80:30174/TCP
+mysql      ClusterIP   10.97.91.106     <none>        3306/TCP
+```
+
+Services match Phase 7 configuration. MySQL on ClusterIP (internal only), backend
+and frontend on NodePort (accessible within cluster and via port-forward).
+
+**Step 5 — Confirm ingress routing:**
+
+```bash
+$ kubectl get ingress -n prod
+NAME               CLASS   HOSTS        ADDRESS        PORTS
+crud-app-ingress   nginx   crud.local   192.168.49.2   80
+```
+
+Ingress configured with `crud.local` host routing. With `minikube tunnel` running and
+`/etc/hosts` entry (`192.168.49.2 crud.local`), the full application is accessible
+at `http://crud.local` in a browser.
+
+### Complete Pipeline → Cluster Data Flow
+
+```
+Developer pushes code to GitLab
+            │
+            ▼
+Pipeline (automated):
+  verify → validate → secret-scan → code-quality → security-scan → build
+            │
+            │  (manual gates)
+            ▼
+  image-scan → push-images → deploy-to-minikube
+            │
+            ▼
+kubectl set image updates Deployment in Kubernetes
+            │
+            ▼
+Kubernetes Rolling Update:
+  New pods scheduled → pull anshuman04/backend:c4ea434d from Docker Hub
+  → New pods Ready → Old pods Terminated
+            │
+            ▼
+Application running in prod namespace:
+  frontend (3 replicas) → Nginx → compiled React app
+  backend  (1 replica)  → Node.js/Express → MySQL
+  mysql    (1 replica)  → MySQL 8 → PVC
+            │
+            ▼
+Verified via kubectl port-forward:
+  http://localhost:8080/                     → 200 (frontend)
+  POST localhost:5001/api/auth/login         → 200 (backend + MySQL)
+```
+
+---
+
+## Phase 8.15 Status: Complete
+
+Application verified end-to-end after pipeline deployment. Frontend HTTP 200,
+backend login API HTTP 200 (MySQL connected). Full DevSecOps loop operational.
+
+**Current pipeline stages (all working):**
+```
+verify → validate → secret-scan → code-quality → security-scan
+       → build → image-scan (manual) → push (manual) → deploy (manual)
+```
+
+**Total jobs: 10 across 9 stages**
+**Next: Phase 8.16 — Failure/Recovery Exercise (deliberate bad deploy → rollback)**
