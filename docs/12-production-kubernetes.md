@@ -99,8 +99,8 @@ scaling and rolling updates — the actual ReplicaSet objects, not just the pod 
 |---|---|
 | 9.1 Readiness Probe | ✅ Complete |
 | 9.2 Liveness Probe | ✅ Complete |
-| 9.3 Resource Requests | ⏳ |
-| 9.4 Resource Limits | ⏳ |
+| 9.3 Resource Requests | ✅ Complete |
+| 9.4 Resource Limits | ✅ Complete |
 | 9.5 Scaling | ⏳ |
 | 9.6 Rolling Update | ⏳ |
 | 9.7 Rollback | ⏳ |
@@ -327,3 +327,187 @@ Health endpoint verified returning `{"status":"healthy","database":"connected"}`
 No probe failures during normal startup.
 
 **Next: Phase 9.3 — Resource Requests**
+
+---
+
+## Phase 9.3 — Resource Requests
+
+### Engineering Problem
+
+Without resource requests, the Kubernetes scheduler has no information about what a pod
+needs. It places pods arbitrarily — potentially on a node that is already under memory
+pressure. When that node runs out of memory, Kubernetes evicts pods to reclaim resources.
+Without requests, the scheduler cannot predict or prevent this.
+
+Resource requests answer a specific question: "What is the minimum this pod needs to
+function?" The scheduler uses this to make placement decisions — it only assigns a pod
+to a node that has at least the requested amount available.
+
+### Implementation
+
+**Backend (`api/`) — Node.js + Express:**
+```yaml
+resources:
+  requests:
+    cpu: "100m"      # 0.1 CPU cores — adequate for idle Express + auth operations
+    memory: "128Mi"  # Node.js baseline + bcrypt + mysql2 driver
+```
+
+**Frontend (`client/`) — Nginx serving static files:**
+```yaml
+resources:
+  requests:
+    cpu: "50m"       # Nginx is nearly idle — static file serving is IO-bound
+    memory: "32Mi"   # nginx:alpine with ~91KB of static content
+```
+
+**MySQL (`mysql/`) — MySQL 8:**
+```yaml
+resources:
+  requests:
+    cpu: "100m"      # MySQL is IO-bound for this workload, not CPU-bound
+    memory: "256Mi"  # InnoDB buffer pool requires meaningful memory
+```
+
+### How the Scheduler Uses Requests
+
+```
+kubectl apply → Kubernetes API → Scheduler
+                                    │
+                                    ├── Finds nodes with enough allocatable capacity
+                                    │     Node.allocatable.cpu >= sum(pod.requests.cpu)
+                                    │     Node.allocatable.memory >= sum(pod.requests.memory)
+                                    │
+                                    └── Places pod on qualifying node
+```
+
+In Minikube (single node), placement is always the same node. The value of requests
+becomes visible when scaling: 10 frontend replicas × 32Mi = 320Mi reserved — the
+scheduler won't place replica 11 if the node has less than 352Mi remaining.
+
+### Verification Commands
+
+```bash
+# Confirm requests are set on running pods
+kubectl describe pod -n prod -l app=backend | grep -A4 "Requests:"
+# Output:
+#   Requests:
+#     cpu:     100m
+#     memory:  128Mi
+
+# View node resource allocation
+kubectl describe node minikube | grep -A8 "Allocated resources"
+# Output shows sum of all pod requests vs node capacity
+
+# Check how much is allocated vs available
+kubectl get node minikube -o jsonpath='{.status.allocatable}' | python3 -m json.tool
+```
+
+---
+
+## Phase 9.4 — Resource Limits
+
+### Engineering Problem
+
+Resource requests guarantee placement. Without limits, a container can consume all
+available resources on a node — starving other pods, including system components like
+etcd and the API server. A memory leak in the Node.js backend would grow unchecked
+until the node OOM-kills random processes.
+
+Resource limits answer a different question: "What is the maximum this pod is allowed
+to consume?" They protect the cluster from runaway workloads.
+
+### How Limits Work
+
+```
+CPU limit:    Container CPU usage > limit → THROTTLED (slowed, not killed)
+Memory limit: Container memory usage > limit → OOMKilled (container killed + restarted)
+```
+
+CPU throttling is invisible to the application — it just runs slower. Memory killing
+is abrupt — the container dies and restarts. This is intentional: unbounded memory
+growth is a sign of a bug (leak), and the correct response is to restart the container
+and alert, not let it consume the whole node.
+
+### Values Chosen
+
+| Container | CPU limit | Memory limit | Reasoning |
+|---|---|---|---|
+| backend | `500m` | `256Mi` | 5× CPU request headroom; 2× memory — bcrypt + JWT under load |
+| frontend | `200m` | `64Mi` | Nginx rarely needs burst CPU; 2× memory for Nginx workers |
+| mysql | `500m` | `512Mi` | InnoDB cache growth; 2× request allows buffer pool to expand |
+
+### Real Failure Observed — Probe 503 During Restart
+
+When resource limits were first applied, a rolling update triggered. During the
+transition, the old backend pod's readiness probe reported:
+
+```
+Warning  Unhealthy  Readiness probe failed: HTTP probe failed with statuscode: 503
+Warning  Unhealthy  Liveness probe failed: HTTP probe failed with statuscode: 503
+```
+
+**Root cause:** The 503 came from the `/health` endpoint's `SELECT 1` query failing
+because MySQL was briefly unreachable during the pod restart cycle. This is correct
+probe behavior — the endpoint detected a real unhealthy state and reported it.
+
+**What Kubernetes did:** The liveness probe fired after 3 failures → container restarted.
+After restart, MySQL reconnected → health endpoint returned 200 → pod became Ready.
+
+**Engineering lesson:** The 503s during startup are not probe bugs — they are the probes
+working exactly as designed. A well-implemented health endpoint that checks real
+dependencies will naturally report unhealthy during startup transitions. This is why
+`initialDelaySeconds` matters: setting it too low causes unnecessary restarts.
+
+### Verification
+
+```bash
+# Confirm limits on running pod
+kubectl describe pod -n prod -l app=backend | grep -A4 "Limits:"
+# Output:
+#   Limits:
+#     cpu:     500m
+#     memory:  256Mi
+
+# All pods running after limit application
+kubectl get pods -n prod
+# NAME                       READY   STATUS    RESTARTS
+# backend-775999bd58-xpzpk   1/1     Running   1 (2m ago)
+# frontend-c8dd876dd-*       1/1     Running   0
+# mysql-7487488b4f-kq98l     1/1     Running   0
+
+# Health confirmed after stabilization
+curl http://localhost:5002/health
+# {"status":"healthy","database":"connected"}
+```
+
+### Debugging Reference
+
+```bash
+# Check if a pod was OOMKilled
+kubectl describe pod <name> -n prod | grep -A3 "Last State:"
+# OOMKilled shows as: Reason: OOMKilled
+
+# Check current resource usage (requires metrics-server)
+kubectl top pods -n prod
+# Install metrics-server in Minikube: minikube addons enable metrics-server
+
+# View all resource requests/limits in namespace
+kubectl get pods -n prod -o custom-columns=\
+"NAME:.metadata.name,\
+CPU_REQ:.spec.containers[0].resources.requests.cpu,\
+MEM_REQ:.spec.containers[0].resources.requests.memory,\
+CPU_LIM:.spec.containers[0].resources.limits.cpu,\
+MEM_LIM:.spec.containers[0].resources.limits.memory"
+```
+
+---
+
+## Phase 9.3 + 9.4 Status: Complete
+
+Resource requests and limits applied to all three deployments (backend, frontend, mysql).
+All pods confirmed running. Probe behavior during rolling update documented.
+Health endpoint verified returning `{"status":"healthy","database":"connected"}` post-restart.
+
+**Commit:** `ec0d8df`
+**Next: Phase 9.5 — Scaling**
