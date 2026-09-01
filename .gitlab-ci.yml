@@ -137,12 +137,20 @@ sonarcloud-analysis:
   script:
     - echo "Running SonarCloud static analysis..."
     - sonar-scanner -Dsonar.host.url=https://sonarcloud.io -Dsonar.token=$SONAR_TOKEN -Dsonar.scanner.skipJreProvisioning=true
-    - echo "Analysis submitted. Checking Quality Gate status..."
-    - sleep 10
+    - echo "Analysis submitted. Waiting 15s for SonarCloud to process the report..."
+    - sleep 15
     - |
-      QG_STATUS=$(curl -s -u "$SONAR_TOKEN:" \
-        "https://sonarcloud.io/api/qualitygates/project_status?projectKey=platform-engineering-journey&branch=main" \
-        | python3 -c "import sys,json; print(json.load(sys.stdin)['projectStatus']['status'])")
+      RESPONSE=$(curl -s -H "Authorization: Bearer $SONAR_TOKEN" \
+        "https://sonarcloud.io/api/qualitygates/project_status?projectKey=platform-engineering-journey")
+      echo "API response: $RESPONSE"
+      QG_STATUS=$(echo "$RESPONSE" | python3 -c "
+      import sys, json
+      data = json.load(sys.stdin)
+      if 'errors' in data:
+          print('ERROR: ' + str(data['errors']))
+          sys.exit(2)
+      print(data['projectStatus']['status'])
+      ")
       echo "Quality Gate status: $QG_STATUS"
       if [ "$QG_STATUS" != "OK" ]; then
         echo "Quality Gate FAILED — pipeline stopped. Status: $QG_STATUS"
