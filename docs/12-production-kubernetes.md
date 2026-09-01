@@ -511,3 +511,166 @@ Health endpoint verified returning `{"status":"healthy","database":"connected"}`
 
 **Commit:** `ec0d8df`
 **Next: Phase 9.5 — Scaling**
+
+---
+
+## Phase 9.5 — Scaling
+
+### Engineering Problem
+
+Scaling is not just changing a number. The exercise is about understanding what
+Kubernetes actually creates and modifies at each layer during a scale event — and
+what the Service's endpoint list looks like at each step.
+
+### Pre-Scaling State
+
+```bash
+$ kubectl get replicasets -n prod -l app=backend
+NAME                 DESIRED   CURRENT   READY   AGE
+backend-775999bd58   1         1         1       9m
+
+$ kubectl get pods -n prod -l app=backend
+NAME                       READY   STATUS    RESTARTS
+backend-775999bd58-xpzpk   1/1     Running   1
+```
+
+One ReplicaSet. One pod. Service endpoint: 1 IP.
+
+### Backend: 1 → 3 → 5
+
+**Scale to 3:**
+```bash
+$ kubectl scale deployment/backend --replicas=3 -n prod
+deployment.apps/backend scaled
+
+$ kubectl get pods -n prod -l app=backend
+NAME                       READY   STATUS              RESTARTS
+backend-775999bd58-mt7wn   0/1     ContainerCreating   0          ← new
+backend-775999bd58-pmd8g   0/1     ContainerCreating   0          ← new
+backend-775999bd58-xpzpk   1/1     Running             1          ← existing
+```
+
+**Key observation:** All three pods share the SAME ReplicaSet (`775999bd58`). Scaling
+does not create a new ReplicaSet — scaling changes the desired count on the existing one.
+A new ReplicaSet is only created during a rolling update (image or spec change).
+
+**Scale to 5 and observe Service endpoints:**
+```bash
+$ kubectl scale deployment/backend --replicas=5 -n prod
+
+$ kubectl get endpoints backend -n prod
+NAME      ENDPOINTS
+backend   10.244.0.30:5000,10.244.0.35:5000,10.244.0.36:5000 + 1 more...
+```
+
+The Service endpoint list grows automatically as new pods pass readiness. The
+`+ 1 more...` indicates 4 endpoints (kubectl truncates at 3). Once all 5 pods pass
+the readiness probe, all 5 IPs appear in the endpoint list and the Service load-balances
+across all of them.
+
+### Frontend: 3 → 5 → 10
+
+```bash
+$ kubectl scale deployment/frontend --replicas=5 -n prod
+$ kubectl scale deployment/frontend --replicas=10 -n prod
+
+$ kubectl get pods -n prod -l app=frontend
+frontend-c8dd876dd-*   1/1   Running   (10 pods, all same ReplicaSet)
+
+$ kubectl get endpoints frontend -n prod
+NAME       ENDPOINTS
+frontend   10.244.0.31:80,10.244.0.33:80,10.244.0.34:80 + 7 more...
+```
+
+10 endpoints. All serving traffic through the Service.
+
+### ReplicaSet Observations
+
+```bash
+$ kubectl get replicasets -n prod -l app=frontend
+NAME                  DESIRED   CURRENT   READY
+frontend-c8dd876dd    10        10        10    ← current, active
+frontend-6b86db8676   0         0         0     ← old (Phase 8 deploys)
+frontend-74c5d4676    0         0         0     ← old
+frontend-7f8cd65557   0         0         0     ← old
+...
+```
+
+Old ReplicaSets remain in the namespace with DESIRED=0. Kubernetes retains them for
+rollback purposes — `kubectl rollout undo` can reactivate any of them. They are
+cleaned up automatically when they exceed `revisionHistoryLimit` (default: 10).
+
+### Scaling Mechanics — Data Flow
+
+```
+kubectl scale deployment/backend --replicas=5 -n prod
+    │
+    ▼
+Kubernetes API updates Deployment.spec.replicas = 5
+    │
+    ▼
+ReplicaSet controller observes: desired=5, current=1
+    │
+    ▼
+Creates 4 new Pod objects (same ReplicaSet, same spec)
+    │
+    ▼
+Scheduler assigns pods to nodes (only node: minikube)
+    │
+    ▼
+kubelet pulls image (cached → fast), starts containers
+    │
+    ▼
+Readiness probe: GET /health → 200
+    │
+    ▼
+Endpoints controller adds pod IP to Service endpoint list
+    │
+    ▼
+All 5 pods receive traffic via kube-proxy load balancing
+```
+
+### Scale Down — Scale Back to Production Values
+
+```bash
+$ kubectl scale deployment/backend --replicas=1 -n prod
+$ kubectl scale deployment/frontend --replicas=3 -n prod
+```
+
+Scale-down is immediate for the Deployment object. Old pods enter `Terminating`
+state — kubelet sends SIGTERM, waits for `terminationGracePeriodSeconds` (default 30s),
+then SIGKILL. The Service endpoint controller removes the pod IP from the endpoint list
+as soon as the pod enters Terminating — no new requests are routed to it.
+
+### Debugging Reference
+
+```bash
+# Scale a deployment
+kubectl scale deployment/<name> --replicas=<n> -n prod
+
+# Watch scaling in real time
+kubectl get pods -n prod -w
+
+# Check current replica count
+kubectl get deployments -n prod
+
+# Inspect ReplicaSets (shows history)
+kubectl get replicasets -n prod
+
+# Check Service endpoints (IPs of Ready pods)
+kubectl get endpoints -n prod
+
+# Describe endpoint object for full IP list
+kubectl describe endpoints backend -n prod
+```
+
+---
+
+## Phase 9.5 Status: Complete
+
+Backend scaled 1→3→5, frontend scaled 3→5→10. ReplicaSet behavior confirmed —
+scaling reuses existing ReplicaSet, does not create new one. Service endpoints
+grow/shrink automatically as pods pass/fail readiness. Scaled back to baseline
+(backend: 1, frontend: 3).
+
+**Next: Phase 9.6 — Controlled Rolling Update (observe old/new ReplicaSet transition)**
