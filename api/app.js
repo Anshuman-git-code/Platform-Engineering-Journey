@@ -46,7 +46,8 @@ app.get('/health', (req, res) => {
     }
     res.status(200).json({
       status: 'healthy',
-      database: 'connected'
+      database: 'connected',
+      version: '2.0.0'
     });
   });
 });
