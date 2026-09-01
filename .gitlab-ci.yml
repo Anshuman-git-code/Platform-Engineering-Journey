@@ -3,6 +3,7 @@ stages:
   - validate
   - secret-scan
   - code-quality
+  - security-scan
 
 # ─────────────────────────────────────────────────────
 # Phase 8A — Runner Verification
@@ -225,3 +226,73 @@ sonarcloud-analysis:
         echo "Quality Gate FAILED. Status: $QG_STATUS"
         exit 1
       fi
+
+# ─────────────────────────────────────────────────────
+# Phase 8.9 — Trivy Filesystem Scan
+#
+# Engineering problem:
+#   Static analysis (Phase 8.7) checks code quality patterns.
+#   GitLeaks (Phase 8.6) checks for committed secrets.
+#   Neither checks whether application dependencies contain
+#   known CVEs. A dependency with a critical vulnerability
+#   will be compiled into the Docker image and deployed to
+#   Kubernetes — at which point it is much harder to remediate.
+#   Scanning the filesystem before the build catches vulnerable
+#   dependencies at the cheapest possible point in the pipeline.
+#
+# What Trivy scans here:
+#   - api/package-lock.json   → backend npm dependency tree
+#   - client/package-lock.json → frontend npm dependency tree
+#   - api/ and client/src/    → source files for embedded secrets
+#
+# Why --exit-code 0 (report but do not fail):
+#   The backend has 2 pre-existing HIGH CVEs in package-lock.json
+#   (jws CVE-2025-65945, path-to-regexp CVE-2026-4867).
+#   These are known and documented. Failing the pipeline on
+#   pre-existing issues in a learning-phase project would block
+#   all downstream stages (Docker build, K8s deploy) without
+#   adding value. In production, --exit-code 1 with a known
+#   vulnerability baseline (.trivyignore) is the correct approach.
+#
+# Why --scanners vuln,secret:
+#   'vuln' scans package manifests for CVE matches.
+#   'secret' scans file content for credential patterns.
+#   Together they cover both the dependency and source layers.
+#
+# Why HIGH,CRITICAL severity filter:
+#   LOW and MEDIUM findings in transitive dependencies are
+#   noise at this stage. HIGH and CRITICAL require attention.
+#
+# Known findings (documented, not blocking):
+#   - jws 3.2.2 (api): CVE-2025-65945 HIGH — HS256 signature
+#     verification flaw. Fix: upgrade to jws 3.2.3 or 4.0.1.
+#     Deferred — jsonwebtoken (which wraps jws) needs testing.
+#   - path-to-regexp 0.1.12 (api): CVE-2026-4867 HIGH — ReDoS
+#     via malformed URL parameters. Fix: upgrade to 0.1.13.
+#     Deferred — Express routing dependency.
+# ─────────────────────────────────────────────────────
+trivy-fs-scan:
+  stage: security-scan
+  tags:
+    - macos
+  script:
+    - echo "Running Trivy filesystem vulnerability scan..."
+    - trivy --version
+    - echo "--- Scanning backend (api/) ---"
+    - trivy fs
+      --scanners vuln,secret
+      --severity HIGH,CRITICAL
+      --skip-dirs node_modules
+      --format table
+      --exit-code 0
+      api/
+    - echo "--- Scanning frontend (client/) ---"
+    - trivy fs
+      --scanners vuln,secret
+      --severity HIGH,CRITICAL
+      --skip-dirs node_modules
+      --skip-dirs build
+      --format table
+      --exit-code 0
+      client/
+    - echo "Trivy filesystem scan complete. Review findings above before Docker build."
