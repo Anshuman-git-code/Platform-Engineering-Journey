@@ -101,9 +101,9 @@ scaling and rolling updates — the actual ReplicaSet objects, not just the pod 
 | 9.2 Liveness Probe | ✅ Complete |
 | 9.3 Resource Requests | ✅ Complete |
 | 9.4 Resource Limits | ✅ Complete |
-| 9.5 Scaling | ⏳ |
-| 9.6 Rolling Update | ⏳ |
-| 9.7 Rollback | ⏳ |
+| 9.5 Scaling | ✅ Complete |
+| 9.6 Rolling Update | ✅ Complete |
+| 9.7 Rollback | ✅ Complete |
 
 ---
 
@@ -674,3 +674,305 @@ grow/shrink automatically as pods pass/fail readiness. Scaled back to baseline
 (backend: 1, frontend: 3).
 
 **Next: Phase 9.6 — Controlled Rolling Update (observe old/new ReplicaSet transition)**
+
+---
+
+## Phase 9.6 — Controlled Rolling Update
+
+### Engineering Problem
+
+Phase 8.16 exercised rollback from a failure. Phase 9.6 observes the rolling update
+mechanics in detail — specifically what Kubernetes creates and destroys at the
+ReplicaSet level during a planned update. This is what happens on every successful
+`kubectl set image` or pipeline deploy.
+
+### The Change — backend v2.0.0
+
+Added `version` field to the `/health` response in `api/app.js`:
+
+```javascript
+res.status(200).json({
+  status: 'healthy',
+  database: 'connected',
+  version: '2.0.0'     // ← new in v2
+});
+```
+
+Committed as `0c0feac`, pushed to Docker Hub as `anshuman04/backend:0c0feac`.
+Pipeline `deploy-to-minikube` job executed `kubectl set image` with the new tag.
+
+### The Rolling Update — `kubectl rollout status` Timeline
+
+From the GitLab CI job log (commit `0c0feac`):
+
+```
+13:22:34  Waiting: 1 out of 3 new replicas have been updated...
+13:23:09  Waiting: 1 out of 3 new replicas have been updated...   ← readiness probe wait
+13:23:09  Waiting: 2 out of 3 new replicas have been updated...   ← pod 1 ready
+13:23:37  Waiting: 2 out of 3 new replicas have been updated...   ← readiness probe wait
+13:23:37  Waiting: 1 old replicas are pending termination...      ← pod 2 ready
+13:24:03  Waiting: 1 old replicas are pending termination...      ← waiting for graceful stop
+13:24:03  deployment "backend" successfully rolled out             ← complete (~102s total)
+```
+
+The 35-second gaps between steps are the readiness probe waiting period —
+`initialDelaySeconds: 15` + up to 3 × `periodSeconds: 10` per new pod before the
+probe passes and the old pod is terminated.
+
+### ReplicaSet Transition — Live Watch Output
+
+The core observation of this phase. Watched via `kubectl get replicasets -n prod -l app=backend -w`:
+
+```
+NAME                 DESIRED   CURRENT   READY    ← State
+backend-775999bd58   3         3         3        ← OLD RS — before update starts
+backend-7d9f64c858   1         1         0   20s  ← NEW RS created, 1st pod starting
+backend-7d9f64c858   1         1         1   36s  ← 1st new pod Ready
+backend-775999bd58   2         3         3   3h35m ← OLD RS desired reduced to 2
+backend-7d9f64c858   2         1         1   36s  ← NEW RS scaled to 2
+backend-775999bd58   2         2         2   3h35m ← OLD RS at 2 ready
+backend-7d9f64c858   2         2         2   63s  ← 2nd new pod Ready
+backend-775999bd58   1         2         2   3h35m ← OLD RS desired reduced to 1
+backend-7d9f64c858   3         2         2   64s  ← NEW RS scaled to 3
+backend-7d9f64c858   3         3         2   64s  ← 3rd pod starting
+backend-7d9f64c858   3         3         3   90s  ← ALL 3 new pods Ready
+backend-775999bd58   0         1         1   3h36m ← OLD RS draining last pod
+backend-775999bd58   0         0         0   3h36m ← OLD RS at 0 — update complete
+```
+
+**What this shows:**
+
+Two ReplicaSets coexist during the transition. Neither is deleted. The old RS scales down
+one pod at a time only after a new pod passes readiness. This is the `maxUnavailable: 0`
+rolling strategy — at no point are there fewer than 3 Ready backend pods.
+
+```
+Time →
+                  RS 775999bd58 (OLD)     RS 7d9f64c858 (NEW)
+Start:            DESIRED=3              DESIRED=0
+Step 1:           DESIRED=3              DESIRED=1, pod starting
+Step 2 (ready):   DESIRED=2              DESIRED=2
+Step 3 (ready):   DESIRED=1              DESIRED=3
+Complete:         DESIRED=0              DESIRED=3
+```
+
+### Verification — New Version Running
+
+```bash
+$ curl http://localhost:5002/health
+{"status":"healthy","database":"connected","version":"2.0.0"}
+```
+
+`version: 2.0.0` confirms the new backend code is running. The old pods that returned
+`{"status":"healthy","database":"connected"}` (no version field) are gone.
+
+### Pod State at Completion
+
+```
+backend-775999bd58-6zwf7   1/1   Terminating   ← old pod draining
+backend-775999bd58-xpzpk   1/1   Terminating   ← old pod draining
+backend-7d9f64c858-9gbb9   1/1   Running       ← new, v2.0.0
+backend-7d9f64c858-frs9k   1/1   Running       ← new, v2.0.0
+backend-7d9f64c858-vk9tx   1/1   Running       ← new, v2.0.0
+```
+
+### Debugging Reference
+
+```bash
+# Watch rolling update live (ReplicaSet level)
+kubectl get replicasets -n prod -l app=backend -w
+
+# Watch pod-level transitions
+kubectl get pods -n prod -l app=backend -w
+
+# Check rollout progress
+kubectl rollout status deployment/backend -n prod
+
+# View rollout history
+kubectl rollout history deployment/backend -n prod
+
+# Verify new version in response
+kubectl port-forward service/backend 5002:5000 -n prod &
+curl http://localhost:5002/health
+```
+
+---
+
+## Phase 9.6 Status: Complete
+
+Rolling update confirmed with live ReplicaSet watch. Two ReplicaSets coexisted during
+transition. Zero downtime — old RS scaled down one pod at a time only after new pods
+passed readiness. New version `2.0.0` confirmed running.
+
+**Next: Phase 9.7 — Rollback Exercise**
+
+---
+
+## Phase 9.7 — Rollback Exercise
+
+### Engineering Problem
+
+The same as Phase 8.16, but now with production hardening in place — probes, resource
+limits, and multiple replicas. The question is: does the rollback mechanism still work
+correctly when the deployment has readiness probes? And does the rolling update safety
+guarantee hold — no downtime even when a new image fails to pull?
+
+### Pre-State
+
+Current: revision 11, image `anshuman04/backend:0c0feacc` (v2.0.0), 3 replicas running.
+
+```bash
+$ kubectl rollout history deployment/backend -n prod | tail -3
+10        <none>
+11        <none>    ← current: anshuman04/backend:0c0feacc
+```
+
+### Step 1 — Inject Bad Image
+
+```bash
+$ kubectl set image deployment/backend backend=anshuman04/backend:v3-broken -n prod
+deployment.apps/backend image updated
+```
+
+### Step 2 — Observe Stall
+
+```bash
+$ kubectl get pods -n prod -l app=backend   # 25s after inject
+NAME                       READY   STATUS             RESTARTS
+backend-7d9f64c858-9gbb9   1/1     Running            0          ← OLD, v2.0.0
+backend-7d9f64c858-frs9k   1/1     Running            0          ← OLD, v2.0.0
+backend-7d9f64c858-vk9tx   1/1     Running            0          ← OLD, v2.0.0
+backend-84cdbc9f94-ptr6v   0/1     ImagePullBackOff   0          ← NEW, broken
+
+$ kubectl describe pod backend-84cdbc9f94-ptr6v -n prod | grep -A6 "Events:"
+Warning  Failed  kubelet  Failed to pull image "anshuman04/backend:v3-broken":
+                 manifest for anshuman04/backend:v3-broken not found: manifest unknown
+Warning  Failed  kubelet  Error: ErrImagePull
+Warning  Failed  kubelet  Error: ImagePullBackOff
+
+$ kubectl rollout status deployment/backend -n prod --timeout=10s
+Waiting: 1 out of 3 new replicas have been updated...
+error: timed out waiting for the condition   ← stalled, as expected
+```
+
+Rolling update stalled. Old pods keep serving traffic.
+
+### Step 3 — Verify Zero Downtime During Stall
+
+```bash
+$ curl http://localhost:5002/health
+{"status":"healthy","database":"connected","version":"2.0.0"}
+```
+
+HTTP 200 confirmed while bad pod is in `ImagePullBackOff`. The readiness probe never
+passed on the broken pod — it was never added to the Service endpoint list. Traffic
+continued routing to the three old pods exclusively.
+
+**This is proof that readiness probes + rolling updates together provide zero-downtime
+protection against bad image deployments.**
+
+### Step 4 — Roll Back
+
+```bash
+$ kubectl rollout undo deployment/backend -n prod
+deployment.apps/backend rolled back
+
+$ kubectl rollout status deployment/backend -n prod --timeout=60s
+Waiting for deployment spec update to be observed...
+Waiting: 1 old replicas are pending termination...
+deployment "backend" successfully rolled out
+```
+
+### Step 5 — Verify Recovery
+
+```bash
+$ kubectl get pods -n prod -l app=backend
+NAME                       READY   STATUS    RESTARTS
+backend-7d9f64c858-9gbb9   1/1     Running   0    ← same ReplicaSet as before bad deploy
+backend-7d9f64c858-frs9k   1/1     Running   0
+backend-7d9f64c858-vk9tx   1/1     Running   0
+
+$ curl http://localhost:5002/health
+{"status":"healthy","database":"connected","version":"2.0.0"}
+
+$ kubectl rollout history deployment/backend -n prod | tail -3
+12        <none>    ← bad deploy (v3-broken)
+13        <none>    ← rollback (restored RS 7d9f64c858 as new revision)
+```
+
+### What Changed vs Phase 8.16
+
+In Phase 8.16 the deployment had no readiness probes. The broken pod went to
+`ImagePullBackOff` but the deployment eventually timed out differently. In Phase 9.7,
+the readiness probe configuration means the broken pod is definitively never added to
+the endpoint list — the protection is explicit and guaranteed, not accidental.
+
+### Rollback with Readiness Probes — Data Flow
+
+```
+kubectl rollout undo deployment/backend
+    │
+    ▼
+Kubernetes activates previous ReplicaSet (7d9f64c858)
+    │
+    ├── New RS desired = 3 (was 0, reactivated)
+    ├── Bad RS desired = 0 (84cdbc9f94 — the broken one)
+    │
+    ▼
+Bad pod (84cdbc9f94-ptr6v) terminated immediately
+    │
+    ▼
+Old pods (7d9f64c858-*) already running — no new pull needed
+    │
+    ▼
+Readiness probe passes (already healthy)
+    │
+    ▼
+Deployment reports: "successfully rolled out"
+```
+
+Since the previous ReplicaSet's pods were still running (they never got terminated
+because the bad pod never passed readiness), the rollback is near-instant.
+
+### Debugging Reference
+
+```bash
+# Check rollout history
+kubectl rollout history deployment/backend -n prod
+
+# Check specific revision image
+kubectl rollout history deployment/backend -n prod --revision=<n>
+
+# Roll back to previous revision
+kubectl rollout undo deployment/backend -n prod
+
+# Roll back to specific revision
+kubectl rollout undo deployment/backend -n prod --to-revision=<n>
+
+# Confirm active image after rollback
+kubectl describe pod -n prod -l app=backend | grep Image:
+```
+
+---
+
+## Phase 9.7 Status: Complete
+
+Rollback confirmed working with readiness probes active. Zero downtime during stall
+verified — old pods served traffic throughout the bad deploy. `kubectl rollout undo`
+succeeded instantly since old ReplicaSet pods were never terminated.
+
+---
+
+## Phase 9 — ALL SUB-PHASES COMPLETE
+
+```
+9.1 ✅ Readiness Probe — /health endpoint, pod waits for MySQL before accepting traffic
+9.2 ✅ Liveness Probe  — container restarted if /health fails 3 times
+9.3 ✅ Resource Requests — scheduler places pods based on declared minimums
+9.4 ✅ Resource Limits  — cluster protected against runaway memory/CPU
+9.5 ✅ Scaling         — backend 1→3→5, frontend 3→5→10, ReplicaSet mechanics observed
+9.6 ✅ Rolling Update  — old/new ReplicaSet coexistence confirmed, live watch output
+9.7 ✅ Rollback        — bad image → stall → zero downtime → rollback → recovery
+```
+
+**Next Phase: Phase 10 — Helm**
