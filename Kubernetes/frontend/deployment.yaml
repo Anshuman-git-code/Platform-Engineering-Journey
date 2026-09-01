@@ -23,9 +23,8 @@ spec:
       containers:
         - name: frontend
 
-          image: frontend:v4
-
-          imagePullPolicy: IfNotPresent
+          image: anshuman04/frontend:latest
+          imagePullPolicy: Always
 
           ports:
             - containerPort: 80

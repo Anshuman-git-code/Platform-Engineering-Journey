@@ -17,8 +17,8 @@ spec:
     spec:
       containers:
         - name: backend
-          image: backend:v2
-          imagePullPolicy: IfNotPresent
+          image: anshuman04/backend:latest
+          imagePullPolicy: Always
           ports:
             - containerPort: 5000
           env:
