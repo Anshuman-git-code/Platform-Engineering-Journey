@@ -46,7 +46,7 @@ The tiers are separated into independent layers. Each layer has a distinct respo
 | Phase 5 | Kubernetes Fundamentals | ✅ Complete |
 | Phase 6 | Kubernetes Application Deployment | ✅ Complete |
 | Phase 7 | Frontend on Kubernetes + NGINX Ingress | ✅ Complete |
-| Phase 8 | GitLab CI/CD | 🚧 Phase 8A Complete |
+| Phase 8 | GitLab CI/CD | 🚧 Phases 8A, 8.5, 8.6, 8.7, 8.8 Complete |
 | Phase 9 | Production Kubernetes Hardening | ⏳ |
 | Phase 10 | Helm | ⏳ |
 | Phase 11 | Terraform | ⏳ |

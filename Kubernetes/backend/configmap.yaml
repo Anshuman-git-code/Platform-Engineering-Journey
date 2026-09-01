@@ -9,3 +9,5 @@ data:
   DB_HOST: mysql
   DB_NAME: crud_app
   DB_USER: root
+
+
