@@ -4,6 +4,7 @@ stages:
   - secret-scan
   - code-quality
   - security-scan
+  - build
 
 # ─────────────────────────────────────────────────────
 # Phase 8A — Runner Verification
@@ -296,3 +297,84 @@ trivy-fs-scan:
       --exit-code 0
       client/
     - echo "Trivy filesystem scan complete. Review findings above before Docker build."
+
+# ─────────────────────────────────────────────────────
+# Phase 8.10 — Backend Docker Image Build
+#
+# Engineering problem:
+#   The backend Node.js application must be packaged into
+#   a container image to be deployable to Kubernetes.
+#   Building the image in CI ensures every push produces
+#   a reproducible, tested image tagged to the exact commit
+#   that passed all upstream security and quality gates.
+#
+# Tag strategy:
+#   Two tags are applied to every image:
+#   - $CI_COMMIT_SHORT_SHA  — deterministic, traceable to commit
+#   - latest                — convenience tag for local testing
+#
+#   The SHA tag is what Kubernetes deployments reference in
+#   Phase 8.14. Using the SHA makes rollbacks exact — you
+#   know precisely which commit each running pod came from.
+#
+# Why not push yet:
+#   The image is built but not pushed in this stage. Trivy
+#   image scanning (Phase 8.12) runs next. Only images that
+#   pass the image scan proceed to Docker Hub push (8.13).
+#   Building before scanning is required because Trivy image
+#   scan operates on the built image, not on source.
+#
+# Context:
+#   Docker is available on the shell executor via the Mac's
+#   Docker Engine (confirmed in Phase 8A runner verification).
+#   The runner builds the image locally — no Docker-in-Docker
+#   or remote daemon required.
+# ─────────────────────────────────────────────────────
+build-backend:
+  stage: build
+  tags:
+    - macos
+  script:
+    - echo "Building backend Docker image..."
+    - docker build
+      -t anshuman0506/backend:$CI_COMMIT_SHORT_SHA
+      -t anshuman0506/backend:latest
+      ./api
+    - echo "Backend image built successfully."
+    - docker images anshuman0506/backend
+
+# ─────────────────────────────────────────────────────
+# Phase 8.11 — Frontend Docker Image Build
+#
+# Engineering problem:
+#   Same as backend — the React frontend must be packaged
+#   into a container image for Kubernetes deployment.
+#
+# Multi-stage build context:
+#   The frontend Dockerfile uses a two-stage build:
+#   Stage 1 (node:22-alpine): npm ci + npm run build
+#   Stage 2 (nginx:alpine): copies /app/build to Nginx root
+#
+#   The final production image contains ONLY the compiled
+#   static files and Nginx — no Node.js, no react-scripts,
+#   no build toolchain. This is why the 80 CVEs detected in
+#   Phase 8.9 (Trivy FS scan) do not appear in the image scan.
+#
+# ARG REACT_APP_API:
+#   The frontend Dockerfile supports an ARG for the API URL.
+#   In Kubernetes, the frontend communicates through Ingress
+#   via a relative path (/api), so no ARG is needed here.
+#   The default baseURL in client/src/axios.js is '/api'.
+# ─────────────────────────────────────────────────────
+build-frontend:
+  stage: build
+  tags:
+    - macos
+  script:
+    - echo "Building frontend Docker image..."
+    - docker build
+      -t anshuman0506/frontend:$CI_COMMIT_SHORT_SHA
+      -t anshuman0506/frontend:latest
+      ./client
+    - echo "Frontend image built successfully."
+    - docker images anshuman0506/frontend

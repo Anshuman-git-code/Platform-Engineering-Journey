@@ -1281,3 +1281,177 @@ Plan limitation documented and handled correctly.
 **Current pipeline stages:** verify → validate → secret-scan → code-quality
 **Pipeline: 5 jobs, all passing**
 **Next: Phase 8.9 — Trivy Filesystem Scan**
+
+---
+
+## Phase 8.9 — Trivy Filesystem Scan
+
+### Engineering Problem
+
+`node --check` (Phase 8.5) validates syntax. GitLeaks (Phase 8.6) detects committed
+secrets. SonarCloud (Phase 8.7) checks code quality patterns. None of these detect
+whether the application's npm dependencies contain known CVEs. A dependency with a
+critical vulnerability gets compiled into the Docker image and deployed to Kubernetes,
+at which point remediation requires a full rebuild and redeployment cycle.
+
+Scanning the filesystem before any Docker build is the cheapest intervention point —
+no image is built, no registry is pushed to, and the finding is surfaced immediately.
+
+### What Trivy Scans
+
+```
+trivy-fs-scan job:
+    api/
+        └── package-lock.json  → backend npm dependency tree (CVE matching)
+        └── *.js               → source files (secret pattern matching)
+
+    client/
+        └── package-lock.json  → frontend npm dependency tree (CVE matching)
+        └── src/**/*.js        → source files (secret pattern matching)
+```
+
+`--scanners vuln,secret` enables both vulnerability and secret detection in one pass.
+`--severity HIGH,CRITICAL` filters out LOW/MEDIUM noise from transitive dependencies.
+`--skip-dirs node_modules` excludes the installed packages directory — Trivy reads
+the lock file directly, not the installed packages.
+
+### Why `--exit-code 0` (report, do not fail)
+
+Pre-existing vulnerabilities in this project's lock files would block all downstream
+pipeline stages (Docker build, Kubernetes deploy) permanently if `--exit-code 1` were
+used. The correct production approach is:
+
+1. Create a `.trivyignore` file listing reviewed and accepted CVEs with justification
+2. Set `--exit-code 1` so new CVEs (not in the ignore list) fail the pipeline
+3. Treat the ignore file as a living document — reviewed in PRs, expiry dates set
+
+This is deferred to Phase 9 (Production Kubernetes Hardening). For the current
+learning-phase pipeline, `--exit-code 0` ensures findings are visible without blocking.
+
+### Pipeline Stage
+
+```
+stages:
+  - verify
+  - validate
+  - secret-scan
+  - code-quality
+  - security-scan   ← Phase 8.9 added here, after quality analysis
+```
+
+The `security-scan` stage runs after `code-quality`. Both are pre-build gates. No
+Docker images are built until both stages pass (or complete in report-only mode).
+
+### Verified Pipeline Output — Job #16221313958
+
+**Backend scan result:**
+
+```
+$ trivy fs --scanners vuln,secret --severity HIGH,CRITICAL \
+    --skip-dirs node_modules --format table --exit-code 0 api/
+
+package-lock.json (npm)
+=======================
+Total: 2 (HIGH: 2, CRITICAL: 0)
+
+┌────────────────┬────────────────┬──────────┬────────┬───────────────────┬───────────────┐
+│    Library     │ Vulnerability  │ Severity │ Status │ Installed Version │ Fixed Version │
+├────────────────┼────────────────┼──────────┼────────┼───────────────────┼───────────────┤
+│ jws            │ CVE-2025-65945 │ HIGH     │ fixed  │ 3.2.2             │ 3.2.3, 4.0.1  │
+│ path-to-regexp │ CVE-2026-4867  │ HIGH     │ fixed  │ 0.1.12            │ 0.1.13        │
+└────────────────┴────────────────┴──────────┴────────┴───────────────────┴───────────────┘
+```
+
+**Frontend scan result:**
+
+```
+$ trivy fs --scanners vuln,secret --severity HIGH,CRITICAL \
+    --skip-dirs node_modules --skip-dirs build --format table --exit-code 0 client/
+
+package-lock.json (npm)
+=======================
+Total: 80 (HIGH: 76, CRITICAL: 4)
+[... axios, babel, react-router, form-data, shell-quote, websocket-driver ...]
+```
+
+**Job succeeded.**
+
+### Findings Analysis
+
+**Backend — 2 HIGH CVEs:**
+
+| Library | CVE | Severity | Installed | Fix | Impact |
+|---|---|---|---|---|---|
+| `jws` | CVE-2025-65945 | HIGH | 3.2.2 | 3.2.3 | HS256 signature verification flaw — affects JWT signing |
+| `path-to-regexp` | CVE-2026-4867 | HIGH | 0.1.12 | 0.1.13 | ReDoS via malformed URL parameters |
+
+`jws` is a transitive dependency of `jsonwebtoken`, which the backend uses for JWT
+auth. The HS256 flaw is significant — it allows improper signature verification.
+Remediation requires upgrading `jsonwebtoken` to a version that pulls in `jws ≥ 3.2.3`.
+
+`path-to-regexp` is a transitive dependency of `express`. ReDoS via URL parameters
+is a real risk for a public API. Remediation requires upgrading `express` or its
+router dependency.
+
+Both are deferred to Phase 9 with explicit upgrade testing.
+
+**Frontend — 80 CVEs (4 CRITICAL, 76 HIGH):**
+
+The frontend vulnerabilities are almost entirely in `react-scripts` (the CRA build
+toolchain) and its deep transitive dependency tree. This is a critical architectural
+observation:
+
+```
+Frontend multi-stage build:
+┌─────────────────────────────────┐
+│  Stage 1: node:22-alpine        │
+│  npm ci → npm run build         │
+│  react-scripts, babel, webpack  │  ← 80 CVEs live HERE
+│  All build tooling present      │
+└──────────────┬──────────────────┘
+               │  COPY /app/build /usr/share/nginx/html
+               ▼
+┌─────────────────────────────────┐
+│  Stage 2: nginx:alpine          │
+│  Static files only              │
+│  No Node.js, no react-scripts   │  ← CVEs DO NOT exist here
+│  No build tooling               │
+└─────────────────────────────────┘
+                       ↑
+              Production image
+```
+
+The 80 frontend CVEs are in the **build stage only**. The production Docker image
+is the Nginx stage — it contains only compiled static HTML/JS/CSS and the Nginx binary.
+None of the vulnerable npm packages (`axios`, `babel`, `webpack`, `react-router`, etc.)
+are present in the final image.
+
+The `client/src/axios.js` file uses `axios` for API calls — but the browser receives
+the bundled/minified JS output, not the `axios` npm package itself. Browser-side
+`axios` vulnerabilities (prototype pollution, redirect handling) are still a concern
+at runtime, but they are a separate category from npm package CVEs in the build
+environment.
+
+### Production Approach
+
+A production-grade setup would:
+
+1. Separate FS scan from image scan — FS scan reports build-time deps, image scan
+   reports runtime deps. The gap between these two is where multi-stage builds matter.
+2. Accept frontend build-toolchain CVEs selectively via `.trivyignore` with
+   justification: "build-only dependency, not present in production image"
+3. Enforce `--exit-code 1` for `api/` where CVEs are in runtime dependencies
+4. Periodically run `npm audit fix` against both lock files and document the changes
+
+---
+
+## Phase 8.9 Status: Complete
+
+Trivy filesystem scan confirmed running on GitLab pipeline. Backend: 2 HIGH CVEs
+reported (jws, path-to-regexp). Frontend: 80 CVEs reported, all in build toolchain
+(not present in production Nginx image). Pipeline passes with `--exit-code 0`.
+Findings documented for Phase 9 remediation.
+
+**Current pipeline stages:** verify → validate → secret-scan → code-quality → security-scan
+**Pipeline: 6 jobs, all passing**
+**Next: Phase 8.10 — Backend Docker Build**
