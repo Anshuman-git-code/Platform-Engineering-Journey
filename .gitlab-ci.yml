@@ -5,6 +5,8 @@ stages:
   - code-quality
   - security-scan
   - build
+  - image-scan
+  - push
 
 # ─────────────────────────────────────────────────────
 # Phase 8A — Runner Verification
@@ -337,11 +339,11 @@ build-backend:
   script:
     - echo "Building backend Docker image..."
     - docker build
-      -t anshuman0506/backend:$CI_COMMIT_SHORT_SHA
-      -t anshuman0506/backend:latest
+      -t anshuman04/backend:$CI_COMMIT_SHORT_SHA
+      -t anshuman04/backend:latest
       ./api
     - echo "Backend image built successfully."
-    - docker images anshuman0506/backend
+    - docker images anshuman04/backend
 
 # ─────────────────────────────────────────────────────
 # Phase 8.11 — Frontend Docker Image Build
@@ -373,8 +375,108 @@ build-frontend:
   script:
     - echo "Building frontend Docker image..."
     - docker build
-      -t anshuman0506/frontend:$CI_COMMIT_SHORT_SHA
-      -t anshuman0506/frontend:latest
+      -t anshuman04/frontend:$CI_COMMIT_SHORT_SHA
+      -t anshuman04/frontend:latest
       ./client
     - echo "Frontend image built successfully."
-    - docker images anshuman0506/frontend
+    - docker images anshuman04/frontend
+
+# ─────────────────────────────────────────────────────
+# Phase 8.12 — Trivy Image Scans
+#
+# Engineering problem:
+#   The filesystem scan (Phase 8.9) checks source-level
+#   dependencies. The image scan checks what actually ends
+#   up inside the built container — OS packages, runtime
+#   libraries, and the final layer composition. These are
+#   different surfaces. A base image (node:22-alpine,
+#   nginx:alpine) may contain OS-level CVEs that are not
+#   visible in package-lock.json scanning.
+#
+# Why after build (not before):
+#   Trivy image scan requires a built image to exist in
+#   the local Docker daemon. It cannot scan source.
+#
+# Why --exit-code 0:
+#   Same rationale as Phase 8.9 — pre-existing CVEs in
+#   base images are documented, not pipeline-blocking in
+#   this learning phase. Production would use --exit-code 1
+#   with a .trivyignore baseline.
+#
+# why: manual — only runs when you click play in GitLab UI.
+#   This avoids re-scanning images on every push while
+#   upstream stages are still being developed.
+# ─────────────────────────────────────────────────────
+trivy-image-scan-backend:
+  stage: image-scan
+  tags:
+    - macos
+  when: manual
+  script:
+    - echo "Scanning backend Docker image for vulnerabilities..."
+    - trivy image
+      --scanners vuln
+      --severity HIGH,CRITICAL
+      --format table
+      --exit-code 0
+      anshuman04/backend:$CI_COMMIT_SHORT_SHA
+    - echo "Backend image scan complete."
+
+trivy-image-scan-frontend:
+  stage: image-scan
+  tags:
+    - macos
+  when: manual
+  script:
+    - echo "Scanning frontend Docker image for vulnerabilities..."
+    - trivy image
+      --scanners vuln
+      --severity HIGH,CRITICAL
+      --format table
+      --exit-code 0
+      anshuman04/frontend:$CI_COMMIT_SHORT_SHA
+    - echo "Frontend image scan complete."
+
+# ─────────────────────────────────────────────────────
+# Phase 8.13 — Docker Hub Push
+#
+# Engineering problem:
+#   Images built in Phase 8.10/8.11 exist only on the
+#   runner Mac's local Docker daemon. They are not
+#   accessible to Kubernetes (even local Minikube) from
+#   the local daemon directly. Pushing to Docker Hub
+#   makes images accessible to any cluster with internet
+#   access, including Minikube when configured with the
+#   correct imagePullPolicy.
+#
+# Authentication:
+#   DOCKER_HUB_USERNAME and DOCKER_HUB_TOKEN are masked
+#   GitLab CI variables — never written in this file.
+#   docker login uses --password-stdin to avoid the token
+#   appearing in process lists.
+#
+# Tag strategy:
+#   Both SHA tag and :latest are pushed.
+#   Kubernetes deployments in Phase 8.14 will use the
+#   SHA tag for exact traceability.
+#
+# why: manual — push only when you explicitly approve.
+#   Prevents accidental pushes on every commit while
+#   the pipeline is still being built and tested.
+# ─────────────────────────────────────────────────────
+push-images:
+  stage: push
+  tags:
+    - macos
+  when: manual
+  script:
+    - echo "Logging in to Docker Hub..."
+    - echo "$DOCKER_HUB_TOKEN" | docker login -u "$DOCKER_HUB_USERNAME" --password-stdin
+    - echo "Pushing backend image..."
+    - docker push anshuman04/backend:$CI_COMMIT_SHORT_SHA
+    - docker push anshuman04/backend:latest
+    - echo "Pushing frontend image..."
+    - docker push anshuman04/frontend:$CI_COMMIT_SHORT_SHA
+    - docker push anshuman04/frontend:latest
+    - echo "All images pushed successfully."
+    - docker logout
