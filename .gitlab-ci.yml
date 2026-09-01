@@ -96,31 +96,36 @@ gitleaks-scan:
     - echo "GitLeaks scan passed — no secrets detected in application source."
 
 # ─────────────────────────────────────────────────────
-# Phase 8.7 — SonarCloud Static Analysis
+# Phase 8.7 + 8.8 — SonarCloud Static Analysis + Quality Gate Enforcement
 #
-# Engineering problem:
-#   Syntax validation (Phase 8.5) checks that code
-#   can be parsed. It does not check code quality,
-#   security hotspots, duplication, complexity, or
-#   known vulnerability patterns. SonarCloud performs
-#   deep static analysis and produces a quality report
-#   visible in the SonarCloud dashboard.
+# Engineering problem (8.7):
+#   Syntax validation (Phase 8.5) checks that code can be parsed.
+#   It does not check code quality, security hotspots, duplication,
+#   complexity, or known vulnerability patterns. SonarCloud performs
+#   deep static analysis and produces a quality report.
+#
+# Engineering problem (8.8):
+#   Without Quality Gate enforcement, analysis is purely informational.
+#   Bad code can proceed to Docker build. The QG must be checked and
+#   the pipeline must fail if the gate is not OK.
 #
 # Architecture:
-#   sonar-scanner (CLI on runner Mac)
-#     → reads source code (api/, client/src/)
-#     → sends analysis to https://sonarcloud.io
-#     → SonarCloud stores results + evaluates Quality Gate
+#   sonar-scanner submits analysis to SonarCloud (no internal polling)
+#     → scanner exits immediately after upload
+#     → CI job polls SonarCloud QG API directly via curl
+#     → parses JSON status field
+#     → exits non-zero if status != OK -> pipeline stops
 #
-# Why SonarCloud instead of local SonarQube:
-#   SonarQube community edition running in Docker via
-#   Colima crashed repeatedly due to Colima VM memory
-#   constraints (2GiB insufficient for ElasticSearch).
-#   SonarCloud is the cloud-hosted equivalent — same
-#   analysis engine, no local infrastructure required.
+# Why not sonar.qualitygate.wait=true:
+#   sonar-scanner's internal QG polling requires the token to have
+#   Execute Analysis permission at the organization level. Project-scoped
+#   tokens do not have this permission, causing exit code 3 "Not authorized"
+#   immediately after analysis upload. The direct API approach uses the same
+#   endpoint but with Basic Auth, which works with project-scoped tokens.
 #
-# sonar-project.properties at repo root contains:
-#   projectKey, organization, sources, exclusions.
+# Quality Gate API:
+#   GET /api/qualitygates/project_status?projectKey=...&branch=...
+#   Response: {"projectStatus": {"status": "OK" | "ERROR" | "NONE"}}
 #
 # SONAR_TOKEN is stored as a masked GitLab CI variable.
 # It is never written in this file.
@@ -129,10 +134,18 @@ sonarcloud-analysis:
   stage: code-quality
   tags:
     - macos
-  variables:
-    SONAR_HOST_URL: "https://sonarcloud.io"
   script:
     - echo "Running SonarCloud static analysis..."
-    - echo "Token length (debug):" ${#SONAR_TOKEN}
     - sonar-scanner -Dsonar.host.url=https://sonarcloud.io -Dsonar.token=$SONAR_TOKEN -Dsonar.scanner.skipJreProvisioning=true
-    - echo "SonarCloud analysis submitted successfully."
+    - echo "Analysis submitted. Checking Quality Gate status..."
+    - sleep 10
+    - |
+      QG_STATUS=$(curl -s -u "$SONAR_TOKEN:" \
+        "https://sonarcloud.io/api/qualitygates/project_status?projectKey=platform-engineering-journey&branch=main" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['projectStatus']['status'])")
+      echo "Quality Gate status: $QG_STATUS"
+      if [ "$QG_STATUS" != "OK" ]; then
+        echo "Quality Gate FAILED — pipeline stopped. Status: $QG_STATUS"
+        exit 1
+      fi
+      echo "Quality Gate PASSED."
